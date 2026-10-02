@@ -26,10 +26,10 @@ function loadConfig() {
     projectSlug: 'cc-proxy',
     logFile: '',
     logLevel: 'info',
-    useProviderModels: false,   // CLI 从不调 /provider/v1/models（模型目录内置在 CLI 里）；默认用内置的 1.73.4 目录
+    useProviderModels: false,   // CLI 从不调 /provider/v1/models（模型目录内置在 CLI 里）；默认用内置的 1.74.0 目录
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
-    cliMode: '', // 信封 mode。留空 = 不带（CLI 1.73.4 的 agent 回合就不带）。服务端枚举：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
+    cliMode: '', // 信封 mode。留空 = 不带（CLI 1.74.0 的 agent 回合就不带）。服务端枚举：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
     tasteLearning: false,       // x-taste-learning。CLI 默认 true（会让服务端从对话里学习「口味」写进账号）；这里默认关
     cliSessionMode: 'interactive', // lifecycle metadata 的 mode —— 注意这是另一个枚举：interactive | non-interactive
     fingerprintSalt: '',
@@ -73,7 +73,7 @@ function loadConfig() {
 
 const CFG = loadConfig();
 
-// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1 起未变，1.73.4 复核一致） ──────
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1 起未变，1.74.0 复核一致） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
   { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },   // TEMP-REVERT
@@ -213,11 +213,11 @@ function deriveDeviceProfile(apiKey, salt, projectDirOverride) {
   return { ...DEVICE_PROFILE, projectDir: `C:\\Users\\${fpOsUser(apiKey, salt)}\\projects\\${project}` };
 }
 
-// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.73.4 源码）。
+// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.74.0 源码）。
 // 真机发的永远是「形状 + 版本号」自洽的组合；如果版本号跟着 npm 走而形状没变，
 // 就变成「自称最新版、却说旧方言」—— 这比版本号过期更容易被行为分析挑出来。
 // 因此这里报的是协议版本，npm 上更新了只告警、不自动改。
-const CC_PROTOCOL_VERSION = '1.73.4';
+const CC_PROTOCOL_VERSION = '1.74.0';
 let CC_VERSION = CC_PROTOCOL_VERSION;
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
 
@@ -454,7 +454,7 @@ async function ensureInitialized(ctx, signal) {
   await state.initializing;
 }
 
-// CLI 进程启动时的上游请求序列（对齐 command-code@1.73.4）：
+// CLI 进程启动时的上游请求序列（对齐 command-code@1.74.0）：
 //   1. setupTelemetry → POST /alpha/lifecycle-events（cli_session_exists）—— 经 createCommandApiClient，
 //      头 = buildCommandApiHeaders：content-type + Content-Type（同样合并成两份）、x-cli-environment、Authorization、
 //      User-Agent: cli、x-command-code-version；启动时还没有活动 span，所以没有 traceparent。
@@ -543,10 +543,10 @@ async function runInitialization(ctx, state, signal) {
   }
 }
 
-// ── CLI 1.73.4 模型能力表（由 command-code@1.73.4 dist/cli.mjs 的内置常量提取）──
-// efforts = getSupportedEfforts 用的表（br）：有表 = 支持思考；值 = 该模型接受的 reasoning_effort 档位
-// textOnly = isKnownTextOnlyModel 用的表（Lr）：命中 = 不支持图片（CLI 会把图片换成占位文字）
-// models = 内置模型目录（YO）里未隐藏的条目，作为 /v1/models 的默认列表（CLI 不调 /provider/v1/models）
+// ── CLI 1.74.0 模型能力表（由 command-code@1.74.0 dist/cli.mjs 的内置常量提取）──
+// efforts = getSupportedEfforts 用的表（Ko）：有表 = 支持思考；值 = 该模型接受的 reasoning_effort 档位
+// textOnly = isKnownTextOnlyModel 用的表（nr）：命中 = 不支持图片（CLI 会把图片换成占位文字）
+// models = 内置模型目录（fL）里未隐藏的条目，作为 /v1/models 的默认列表（CLI 不调 /provider/v1/models）
 const CLI_EFFORT_PRESETS = {
   E0: ['low', 'medium', 'high', 'xhigh', 'max'],
   E1: ['low', 'medium', 'high', 'xhigh'],
@@ -809,7 +809,7 @@ function getDateStr() {
 const WIRE_TOOL_ALIASES = Symbol('wireToolAliases'); // wire 名 → 客户端原名（响应里要改回去）
 const WIRE_TOOL_SCHEMAS = Symbol('wireToolSchemas'); // wire 名 → input_schema（修整 tool-call 输入用）
 
-// CLI 1.73.4 的 toWireToolName：只有一条重写（jw="tool_search" → Uw="search_tools"）。
+// CLI 1.74.0 的 toWireToolName：只有一条重写（dv="tool_search" → cv="search_tools"）。
 // 1.53.1 时代的 bash_output/task_output → shell_output、read_multiple_files → read_file 已不复存在；
 // 而且那两条会把两个不同的客户端工具折成同一个名字。
 const TOOL_NAME_ALIASES = { tool_search: 'search_tools' };
@@ -1000,7 +1000,7 @@ function buildCcRequest(openaiReq) {
   }
 
   // 信封键序对齐 CLI：config, memory, taste, skills, permissionMode, threadId, mode, promptCache, params
-  // （threadId 在 forwardToCC 里补）。CLI 1.73.4 的 agent 回合**不带 mode**（主循环配置里没有这个字段，
+  // （threadId 在 forwardToCC 里补）。CLI 1.74.0 的 agent 回合**不带 mode**（主循环配置里没有这个字段，
   // JSON 序列化时整键消失）；只有 title-gen / compact 等功能调用才带。cliMode 可显式指定。
   const body = {
     config: {
@@ -1717,7 +1717,7 @@ function tapUpstreamHealth(response, lease, signal) {
 
 // ── 流式转发 ────────────────────────────────────────
 
-// ── 请求头（逐键对齐 CLI 1.73.4）─────────────────────
+// ── 请求头（逐键对齐 CLI 1.74.0）─────────────────────
 // createNodeTransport 先放小写的 "content-type"，buildCommandAuthHeaders 再放 "Content-Type" —— 两个键大小写不同，
 // fetch 的 Headers 会把它们合并成一行 `content-type: application/json, application/json`，真机线上就是这样。
 // 键的插入顺序 = undici 的发送顺序，也照搬。

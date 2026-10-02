@@ -61,10 +61,10 @@ commandcode/
 | `apiKey` | `""` | Optional fallback API key (requests can also send it via header) |
 | `logFile` | `""` | Log file path (empty = console only) |
 | `logLevel` | `info` | Log level |
-| `useProviderModels` | `false` | Fetch the model list from `/provider/v1/models`. Off by default: the real CLI never calls that endpoint (its catalog is built in), so `/v1/models` serves the CLI 1.73.4 built-in catalog |
+| `useProviderModels` | `false` | Fetch the model list from `/provider/v1/models`. Off by default: the real CLI never calls that endpoint (its catalog is built in), so `/v1/models` serves the CLI 1.74.0 built-in catalog |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
 | `zdr` | `false` | Request ZDR-only routing from Command Code |
-| `cliMode` | `""` (omitted) | Envelope `mode`. CLI 1.73.4 agent turns send **no** `mode` key; set it only to imitate a feature call. Upstream enum: `agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
+| `cliMode` | `""` (omitted) | Envelope `mode`. CLI 1.74.0 agent turns send **no** `mode` key; set it only to imitate a feature call. Upstream enum: `agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
 | `tasteLearning` | `false` | `x-taste-learning` header. The CLI defaults to `true`, which lets Command Code learn a taste profile from the account's conversations; kept off here |
 | `cliSessionMode` | `interactive` | `mode` inside the lifecycle metadata (**a different enum**: `interactive` / `non-interactive`) |
 | `fingerprintSalt` | `""` | Salt for the device fingerprint — use it to rotate the whole fleet's identity (one key still always reports one device) |
@@ -249,7 +249,7 @@ OpenAI Chat Completions compatible. Supports streaming, non-streaming, tool call
 | `messages` | Yes | Conversation messages, supports `system/user/assistant/tool` roles |
 | `max_tokens` | No | Max tokens to generate (default 64000) |
 | `stream` | No | SSE streaming (default false) |
-| `temperature` | No | Accepted but **not sent upstream** — CLI agent turns never send it (see [CLI parity](#cli-parity-command-code1734)) |
+| `temperature` | No | Accepted but **not sent upstream** — CLI agent turns never send it (see [CLI parity](#cli-parity-command-code1740)) |
 | `reasoning_effort` | No | Snapped to a level the model supports per the CLI capability table; omitted for models without thinking support |
 | `tools` | No | Tool definitions (OpenAI function calling format) |
 | `tool_choice` | No | Emulated (never sent): `none` → `tools: []`; a named function → only that tool + a system directive; `required` → system directive |
@@ -542,7 +542,7 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 
 ## Anti-Detection
 
-Aligned line-by-line against the official npm package source (`command-code@1.73.4`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
+Aligned line-by-line against the official npm package source (`command-code@1.74.0`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
 
 | Mechanism | Implementation |
 |-----------|---------------|
@@ -550,14 +550,14 @@ Aligned line-by-line against the official npm package source (`command-code@1.73
 | **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`, `sessionId` = `sess_` + first 16 hex of a UUIDv4) sent in parallel with the fingerprint on key init |
 | **Session start** | `GET /alpha/whoami`, then `GET /alpha/billing/subscriptions?orgId=` + `/alpha/billing/credits?orgId=` — the CLI's billing prefetch, with the same headers as generate |
 | **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
-| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.73.4`); newer npm releases only raise a drift **warning**, never a silent version bump |
+| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.74.0`); newer npm releases only raise a drift **warning**, never a silent version bump |
 | **CLI Envelope** | Key order `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params`; agent turns omit `mode` and `promptCache` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **Headers** | Same keys, order and casing as the CLI, including its quirk `content-type: application/json, application/json` (transport + auth headers both set it); `User-Agent: cli` on generate, fingerprint and lifecycle; `x-taste-learning: "false"` (configurable) |
 | **Transport** | Native `fetch` (undici) everywhere, as in the CLI — pooled accounts too, through their own undici `Agent` — so default headers (`accept`, `accept-encoding`, `sec-fetch-mode`, …) match |
 | **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)` — same source as `config.workingDir` (default `C:\Users\dev\projects\app`, override with `CC_DEVICE_PROJECT_DIR`) |
 | **Single Source of Device Truth** | Fingerprint / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle `os` all read one `DEVICE_PROFILE` (`win32` / `x64`) — so they cannot contradict each other ("fingerprint says win32, environment says linux"), and the host's real platform, Node version and cwd are never handed upstream |
-| **Reasoning Effort** | Gated by the CLI 1.73.4 capability table: sent only for thinking-capable models, snapped to a supported level |
+| **Reasoning Effort** | Gated by the CLI 1.74.0 capability table: sent only for thinking-capable models, snapped to a supported level |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
@@ -603,7 +603,7 @@ Aligned line-by-line against the official npm package source (`command-code@1.73
 
 `params` keys are in the CLI's order. `tools` is always present (`[]` without tools). `reasoning_effort` is only sent when the model supports thinking. `temperature`, `tool_choice` and `parallel_tool_calls` are never sent. When a `prompt_cache_key` is present, the cache breakpoint lands on the last system block, the only place the CLI ever sends `cache_control`.
 
-### CLI parity (`command-code@1.73.4`)
+### CLI parity (`command-code@1.74.0`)
 
 **Outgoing** (what is sent to `/alpha/generate`), mirroring `createModelClient` / `toWireMessages`:
 

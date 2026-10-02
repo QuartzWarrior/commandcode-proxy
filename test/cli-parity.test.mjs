@@ -1,4 +1,4 @@
-// 线上字节对齐 command-code@1.73.4：请求头（含顺序与 content-type 合并）、信封与 params 键序、
+// 线上字节对齐 command-code@1.74.0：请求头（含顺序与 content-type 合并）、信封与 params 键序、
 // CLI 从不发的字段（temperature / tool_choice / parallel_tool_calls）的模拟、工具名重写与回写、
 // 上游事件整形（providerExecuted / tool-result / abort / 字符串 error）、思考档位吸附、纯文本模型去图、
 // 以及启动请求序列（lifecycle / fingerprint / whoami + billing）。
@@ -63,7 +63,7 @@ test('generate：请求头逐键对齐 CLI（顺序、content-type 合并成两�
     assert.deepEqual([...idx].sort((a, b) => a - b), idx, `header order: ${names.join(',')}`);
     assert.equal(g.headers['content-type'], 'application/json, application/json');
     assert.equal(g.headers['user-agent'], 'cli');
-    assert.equal(g.headers['x-command-code-version'], '1.73.4');
+    assert.equal(g.headers['x-command-code-version'], '1.74.0');
     assert.equal(g.headers['x-taste-learning'], 'false');
     for (const h of ['accept', 'accept-language', 'sec-fetch-mode', 'accept-encoding']) assert.ok(g.headers[h], `undici default ${h}`);
     assert.match(g.headers.traceparent, /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
@@ -255,7 +255,7 @@ test('启动序列：lifecycle（content-type ×2、UA cli、sess_ 形态）、f
     assert.equal(lc.headers.traceparent, undefined);
     const meta = JSON.parse(lc.raw).metadata;
     assert.match(meta.sessionId, /^sess_[0-9a-f]{12}4[0-9a-f]{3}$/);
-    assert.equal(meta.cliVersion, '1.73.4');
+    assert.equal(meta.cliVersion, '1.74.0');
 
     const fp = by('/alpha/fingerprint/record');
     assert.equal(fp.headers['content-type'], 'application/json');

@@ -4,7 +4,7 @@
  *
  *   npm run login -- --name alice --proxy http://user:pass@host:port
  *
- * 流程逐条对齐 command-code@1.73.4 的 createAuthFlowController / createAuthServer：
+ * 流程逐条对齐 command-code@1.74.0 的 createAuthFlowController / createAuthServer：
  *   1. 在 127.0.0.1 起回调服务（默认随机端口，CLI 的 Zo=0），生成 32 字节 base64url 的 state；
  *   2. 打开 https://commandcode.ai/studio/auth/cli?callback=http://127.0.0.1:<port>/callback&state=…&mode=redirect；
  *   3. 网页登录后把新签发的 key 以表单 POST 回 /callback（apiKey / state / userId / userName / keyName），
@@ -30,7 +30,7 @@ import { createUpstreamFetch, normalizePoolConfig, parseProxyUrl, redactProxyUrl
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ── CLI 1.73.4 常量 ──
+// ── CLI 1.74.0 常量 ──
 const STUDIO_BASE = { prod: 'https://commandcode.ai', staging: 'https://staging.commandcode.ai', local: 'http://localhost:3000' };
 const CORS_ORIGINS = ['http://localhost:3000', 'https://staging.commandcode.ai', 'https://commandcode.ai'];
 const COMPLETE_PATH = '/callback/complete';

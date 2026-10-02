@@ -4,7 +4,7 @@
 
 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。零外部依赖。
 
-逐条对齐官方 npm 包源码（`command-code@1.73.4`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
+逐条对齐官方 npm 包源码（`command-code@1.74.0`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
 **完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志 | **多账号池**（每账号独立代理、负载均衡、相互隔离）
 
@@ -61,10 +61,10 @@ commandcode/
 | `apiKey` | `""` | 可选兜底 API Key（请求也可通过 header 传入） |
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
 | `logLevel` | `info` | 日志级别 |
-| `useProviderModels` | `false` | 从 `/provider/v1/models` 拉模型列表。默认关：真 CLI 从不调这个端点（目录内置），`/v1/models` 返回 CLI 1.73.4 的内置目录 |
+| `useProviderModels` | `false` | 从 `/provider/v1/models` 拉模型列表。默认关：真 CLI 从不调这个端点（目录内置），`/v1/models` 返回 CLI 1.74.0 的内置目录 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `zdr` | `false` | 请求 Command Code 使用 ZDR-only 路由 |
-| `cliMode` | `""`（不带）| 信封 `mode`。CLI 1.73.4 的 agent 回合**不带** `mode` 键；只有想模仿功能调用时才设。上游枚举：`agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
+| `cliMode` | `""`（不带）| 信封 `mode`。CLI 1.74.0 的 agent 回合**不带** `mode` 键；只有想模仿功能调用时才设。上游枚举：`agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
 | `tasteLearning` | `false` | `x-taste-learning` 头。CLI 默认 `true`（服务端会从账号的对话里学习「口味」档案），这里默认关 |
 | `cliSessionMode` | `interactive` | lifecycle 元数据里的 `mode`（**另一个枚举**：`interactive` / `non-interactive`）|
 | `fingerprintSalt` | `""` | 设备指纹的盐。**成批换设备身份**就用它（同一个 key 永远报同一台设备）|
@@ -244,7 +244,7 @@ OpenAI Chat Completions 兼容。支持流式和非流式、工具调用、多�
 | `messages` | 是 | 对话消息，支持 `system/user/assistant/tool` 角色 |
 | `max_tokens` | 否 | 最大生成 token（默认 64000） |
 | `stream` | 否 | 是否 SSE 流式（默认 false） |
-| `temperature` | 否 | 接受但**不上送** —— CLI 的 agent 回合从不发（见 [CLI 对齐](#cli-对齐command-code1734)）|
+| `temperature` | 否 | 接受但**不上送** —— CLI 的 agent 回合从不发（见 [CLI 对齐](#cli-对齐command-code1740)）|
 | `reasoning_effort` | 否 | 按 CLI 能力表吸附到该模型受支持的档位；不支持思考的模型不发 |
 | `tools` | 否 | 工具定义（OpenAI function calling 格式）|
 | `tool_choice` | 否 | 模拟实现（从不上送）：`none` → `tools: []`；指定函数 → 只发该工具 + 系统指令；`required` → 系统指令 |
@@ -545,14 +545,14 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`，`sessionId` = `sess_` + UUIDv4 去横线前 16 位）|
 | **会话开始** | `GET /alpha/whoami`，再 `GET /alpha/billing/subscriptions?orgId=` + `/alpha/billing/credits?orgId=` —— CLI 的 billing 预取，头与 generate 相同 |
 | **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
-| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.73.4`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
+| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.74.0`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
 | **CLI 信封格式** | 键序 `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params`；agent 回合不带 `mode` 与 `promptCache` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **请求头** | 键、顺序、大小写与 CLI 一致，包括它的怪癖 `content-type: application/json, application/json`（传输层与鉴权头各设一次）；generate / 指纹 / lifecycle 都带 `User-Agent: cli`；`x-taste-learning: "false"`（可配）|
 | **传输** | 与 CLI 一样全程用原生 `fetch`（undici）—— 池账号也是，各用自己的 undici `Agent` —— 默认头（`accept`、`accept-encoding`、`sec-fetch-mode` …）一致 |
 | **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)`，与 `config.workingDir` 同源（默认 `C:\Users\dev\projects\app`，用 `CC_DEVICE_PROJECT_DIR` 改）|
 | **设备档案单一真源** | 指纹 / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle 的 `os` 共用同一份 `DEVICE_PROFILE`（`win32` / `x64`）—— 既不会自相矛盾（"指纹说 win32、环境说 linux"），也不把宿主真实平台、Node 版本、cwd 交给上游 |
-| **思考强度** | 按 CLI 1.73.4 能力表：只对支持思考的模型发送，并吸附到受支持的档位 |
+| **思考强度** | 按 CLI 1.74.0 能力表：只对支持思考的模型发送，并吸附到受支持的档位 |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
@@ -598,7 +598,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 
 `params` 键序与 CLI 一致。`tools` 总是存在（没有工具时为 `[]`）。`reasoning_effort` 只在模型支持思考时发送。`temperature`、`tool_choice`、`parallel_tool_calls` 从不发送。给了 `prompt_cache_key` 时，缓存断点落在 system 最后一块 —— 这也是 CLI 唯一会发 `cache_control` 的位置。
 
-### CLI 对齐（`command-code@1.73.4`）
+### CLI 对齐（`command-code@1.74.0`）
 
 **上行**（发往 `/alpha/generate` 的内容），对齐 `createModelClient` / `toWireMessages`：
 
