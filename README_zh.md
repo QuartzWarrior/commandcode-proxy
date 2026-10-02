@@ -35,6 +35,7 @@ commandcode/
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # 核心代理（协议转换、各接口处理）
 ├── pool.mjs              # 账号池：调度、健康、每账号出口、配置校验
+├── login.mjs             # `npm run login`：CLI 同款浏览器登录，把账号加进账号池
 ├── pool.example.json     # 账号池配置模板（复制为 pool.json 并 chmod 600）
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
 ├── docker-compose.yml    # 容器编排
@@ -159,6 +160,21 @@ export CC_KEY_ALICE=user_xxx CC_PROXY_ALICE=http://user:pass@proxy-a.example:808
 export CC_KEY_BOB=user_yyy   CC_PROXY_BOB=https://proxy-b.example:443
 HOST=127.0.0.1 CC_POOL_CONFIG=./pool.json npm start
 ```
+
+**添加账号：`npm run login`** —— 与官方 CLI 同一套登录流程，结果直接写进账号池配置：
+
+```bash
+npm run login -- --name alice --proxy http://user:pass@proxy-a.example:8080
+npm run login -- --name bob   --proxy https://user:pass@proxy-b.example:443
+npm run login -- --list                 # key 打码、代理脱敏
+npm run login -- --remove bob
+```
+
+- **浏览器登录**：与 `cmd login` 一样，在 `127.0.0.1` 起回调服务，打印并打开 `https://commandcode.ai/studio/auth/cli?…`，网页把新签发的 API key 回传给回调（校验 state）。无图形界面的服务器上，先转发打印出的端口（`ssh -L <端口>:127.0.0.1:<端口> …`），或用 `--port` 固定端口。
+- **其它方式**：在提示处粘贴 key，或 `--key user_…`（用 `GET /alpha/whoami` **经该账号的代理**验证，与 CLI 的手动输入分支一致），或 `--from-cli` 导入官方 CLI 保存在 `~/.commandcode/auth.json` 的 key。
+- **写入方式**：按名字更新账号，没有则追加，其它账号与设置保留。`pool.json` 不存在时以 600 权限新建。期间被并发修改则放弃写入。key 复用或代理共享会在写入前被拒绝。`--proxy-env VAR` 存 `proxyEnv` 引用而不是代理 URL 原文。
+- **IP 一致性**：浏览器登录期间 CLI 自己不发任何上游请求，key 由网页签发，所以登录时看到的是你浏览器的 IP。想让账号只出现在一个 IP 上，就用配了同一代理的浏览器打开登录链接。
+- **生效方式**：增删账号后需重启代理。
 
 之后客户端调用代理时**不带** API key（或带任意非 `user_` 的 token），由代理挑账号。
 

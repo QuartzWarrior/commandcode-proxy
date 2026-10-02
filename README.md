@@ -35,6 +35,7 @@ commandcode/
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # Proxy core (protocol translation, handlers)
 ├── pool.mjs              # Account pool: scheduling, health, per-account egress, config validation
+├── login.mjs             # `npm run login`: CLI-style browser login that adds an account to the pool
 ├── pool.example.json     # Account pool config template (copy to pool.json, chmod 600)
 ├── Dockerfile            # Container build (node:22-alpine)
 ├── docker-compose.yml    # Container orchestration
@@ -164,6 +165,21 @@ export CC_KEY_ALICE=user_xxx CC_PROXY_ALICE=http://user:pass@proxy-a.example:808
 export CC_KEY_BOB=user_yyy   CC_PROXY_BOB=https://proxy-b.example:443
 HOST=127.0.0.1 CC_POOL_CONFIG=./pool.json npm start
 ```
+
+**Adding accounts: `npm run login`** — the same login the official CLI uses, written straight into the pool config:
+
+```bash
+npm run login -- --name alice --proxy http://user:pass@proxy-a.example:8080
+npm run login -- --name bob   --proxy https://user:pass@proxy-b.example:443
+npm run login -- --list                 # keys masked, proxies redacted
+npm run login -- --remove bob
+```
+
+- **Browser login:** like `cmd login`, it starts a callback on `127.0.0.1`, prints and opens `https://commandcode.ai/studio/auth/cli?…`, and the website hands a fresh API key back to the callback (state-checked). On a headless server, forward the printed port first (`ssh -L <port>:127.0.0.1:<port> …`), or fix it with `--port`.
+- **Other ways in:** paste a key at the prompt, pass `--key user_…` (validated with `GET /alpha/whoami` **through the account's proxy**, exactly like the CLI's manual entry), or `--from-cli` to import the key the official CLI saved in `~/.commandcode/auth.json`.
+- **What gets saved:** the account is updated by name or appended. Other accounts and settings are preserved. `pool.json` is created with mode 600 if missing. Concurrent edits abort the write. A reused key or shared proxy is rejected before anything is written. `--proxy-env VAR` stores a `proxyEnv` reference instead of the literal URL.
+- **IP consistency:** during browser login the CLI itself makes no upstream request; the key comes from the website. Which IP the account's login is seen from is therefore your browser's. For a single-IP history, open the link in a browser that uses the same proxy.
+- **Applying changes:** restart the proxy after adding or removing accounts.
 
 Clients then call the proxy **without** an API key (or with any non-`user_` token); the proxy picks an account.
 

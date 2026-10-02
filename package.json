@@ -7,6 +7,7 @@
   "main": "proxy.mjs",
   "scripts": {
     "start": "node proxy.mjs",
+    "login": "node login.mjs",
     "dev": "node --watch proxy.mjs",
     "test": "node --test test/*.test.mjs",
     "docker:build": "docker build -t commandcode-proxy:latest .",
