@@ -2,11 +2,11 @@
 
 > [中文文档](README_zh.md)
 
-A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Single file, zero external dependencies.
+A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Zero external dependencies.
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
-**Features**: OpenAI Chat Completions / **Responses API (`/v1/responses`)** + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: OpenAI Chat Completions / **Responses API (`/v1/responses`)** + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging | **Multi-account pool** with per-account proxies, load balancing and isolation
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
@@ -33,7 +33,9 @@ commandcode/
 ├── config.json           # Port / log path etc.
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # Single-file proxy core (~1900 lines)
+├── proxy.mjs             # Proxy core (protocol translation, handlers)
+├── pool.mjs              # Account pool: scheduling, health, per-account egress, config validation
+├── pool.example.json     # Account pool config template (copy to pool.json, chmod 600)
 ├── Dockerfile            # Container build (node:22-alpine)
 ├── docker-compose.yml    # Container orchestration
 ├── .dockerignore         # Build context exclusions
@@ -58,14 +60,16 @@ commandcode/
 | `apiKey` | `""` | Optional fallback API key (requests can also send it via header) |
 | `logFile` | `""` | Log file path (empty = console only) |
 | `logLevel` | `info` | Log level |
-| `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
+| `useProviderModels` | `false` | Fetch the model list from `/provider/v1/models`. Off by default: the real CLI never calls that endpoint (its catalog is built in), so `/v1/models` serves the CLI 1.73.4 built-in catalog |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
 | `zdr` | `false` | Request ZDR-only routing from Command Code |
-| `cliMode` | `agent` | Envelope `mode`. Upstream enum: `agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
+| `cliMode` | `""` (omitted) | Envelope `mode`. CLI 1.73.4 agent turns send **no** `mode` key; set it only to imitate a feature call. Upstream enum: `agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
+| `tasteLearning` | `false` | `x-taste-learning` header. The CLI defaults to `true`, which lets Command Code learn a taste profile from the account's conversations; kept off here |
 | `cliSessionMode` | `interactive` | `mode` inside the lifecycle metadata (**a different enum**: `interactive` / `non-interactive`) |
 | `fingerprintSalt` | `""` | Salt for the device fingerprint — use it to rotate the whole fleet's identity (one key still always reports one device) |
 | `deviceProjectDir` | `""` | Faked project directory (empty = built-in `C:\Users\dev\projects\app`); changing it gives every account a different device |
 | `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
+| `poolConfig` | `""` | Path to a private account pool config (relative to `proxy.mjs`); enables pool mode — see [Account pool](#account-pool-poolconfig--cc_pool_config) |
 
 ### Environment Variables
 
@@ -74,12 +78,15 @@ commandcode/
 | `PORT` | `3000` (shipped config.json uses `3050`) | Listen port → `port` |
 | `HOST` | `0.0.0.0` | Listen address → `host` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | Upstream base URL → `apiBase` |
-| `CC_UPSTREAM_PROXY` | *(unset)* | Route requests **to the CC upstream** through an HTTP proxy (`http://` CONNECT only); see "Upstream proxy" below → `upstreamProxy` |
+| `CC_UPSTREAM_PROXY` | *(unset)* | Route requests **to the CC upstream** through an `http://` (CONNECT) or `https://` proxy; see "Upstream proxy" below → `upstreamProxy` |
+| `CC_POOL_CONFIG` | *(unset)* | Account pool config path (relative to the working directory) → `poolConfig` |
+| `CC_POOL_ALLOW_NETWORK` | *(unset)* | `1` permits a non-loopback bind in pool mode (no client auth!) |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | empty | Log file → `logFile` (**synchronous writes**, see [Other notes](#other-notes)) |
-| `CC_USE_PROVIDER_MODELS` | `true` | Fetch the model list dynamically → `useProviderModels` |
+| `CC_USE_PROVIDER_MODELS` | `false` | `true` fetches the model list from `/provider/v1/models` → `useProviderModels` |
 | `CMD_ZDR` | off | `1` enables ZDR-only routing → `zdr` |
-| `CC_CLI_MODE` | `agent` | Envelope `mode` → `cliMode` |
+| `CC_CLI_MODE` | empty (omitted) | Envelope `mode` → `cliMode` |
+| `CC_TASTE_LEARNING` | `false` | `true` sends `x-taste-learning: true` → `tasteLearning` |
 | `CC_CLI_SESSION_MODE` | `interactive` | Lifecycle metadata `mode` → `cliSessionMode` |
 | `CC_FINGERPRINT_SALT` | empty | Fingerprint salt → `fingerprintSalt` |
 | `CC_DEVICE_PROJECT_DIR` | empty | Faked project directory → `deviceProjectDir` |
@@ -138,14 +145,79 @@ Route the requests the proxy makes **to Command Code** through a local HTTP prox
 CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 ```
 
-- Applies to `/alpha/generate`, `/alpha/fingerprint/record`, `/alpha/lifecycle-events` and `/provider/v1/models`.
+- Applies to every upstream call: `/alpha/generate`, `/alpha/fingerprint/record`, `/alpha/lifecycle-events`, `/alpha/whoami`, `/alpha/billing/*` and (if enabled) `/provider/v1/models`.
 - **Does not** touch the local listener, `/health`, or the npm version check.
-- Only `http://` (CONNECT) proxies are supported. Implemented with a plain CONNECT tunnel plus `node:https` reusing the same socket, so there is **no new dependency** and it works on Node 18+.
+- `http://` (CONNECT) and `https://` (TLS to the proxy, then CONNECT) proxies are supported. Implemented with a plain CONNECT tunnel plus `node:https` reusing the same socket, so there is **no new dependency** and it works on Node 18+.
 - Each upstream request opens its own tunnel connection. TLS is end-to-end: the certificate is validated against the **target hostname**, never against the proxy.
 - Routing the fingerprint/lifecycle pre-requests through the same proxy matters: if they went out direct while generation went through the proxy, one account would register from two different IPs — exactly the inconsistency you are trying to avoid.
 - Credentials in the proxy URL (`http://user:pass@host:port`) are never logged: only `host:port` shows up.
 
 > Node's built-in `fetch` does **not** read `HTTPS_PROXY`/`HTTP_PROXY`. The official env-var route requires Node ≥ 22.21 / 24.5 plus `NODE_USE_ENV_PROXY=1`; this option works without either.
+
+### Account pool (`poolConfig` / `CC_POOL_CONFIG`)
+
+Puts **multiple Command Code accounts behind one endpoint**. Each account has its own key, its own outbound proxy and its own device identity, and accounts are kept isolated from each other. Requests are load-balanced across healthy accounts, and conversations stay on one account. This is a port of the pool design used in the [openai-oauth fork](https://github.com/QuartzWarrior/openai-oauth).
+
+```bash
+cp pool.example.json pool.json && chmod 600 pool.json   # holds keys: must not be readable by others
+export CC_KEY_ALICE=user_xxx CC_PROXY_ALICE=http://user:pass@proxy-a.example:8080
+export CC_KEY_BOB=user_yyy   CC_PROXY_BOB=https://proxy-b.example:443
+HOST=127.0.0.1 CC_POOL_CONFIG=./pool.json npm start
+```
+
+Clients then call the proxy **without** an API key (or with any non-`user_` token); the proxy picks an account.
+
+> ⚠️ **Pool mode has no client authentication.** Anyone who can reach the port can use every account in the pool. The proxy therefore **refuses to start on a non-loopback host** unless you set `"allowNetwork": true` or `CC_POOL_ALLOW_NETWORK=1`. Do that only on a trusted network or behind your own auth/TLS (Docker needs it, because the container binds `0.0.0.0`). The pool is not a multi-tenant boundary.
+
+**Account fields**
+
+| Field | Description |
+|------|-------------|
+| `name` | Required, unique. Used in logs and `/pool/stats` (the key is never logged) |
+| `apiKey` / `apiKeyEnv` | The `user_…` key, inline or read from an env var (one of the two). Duplicate keys are rejected |
+| `proxy` / `proxyEnv` | Optional per-account egress: `http://` (CONNECT) or `https://` (TLS to the proxy, then CONNECT). Two accounts with the same proxy host:port **and** credentials are rejected unless `allowSharedProxy` |
+| `weight` | Load-balancing weight (default `1`) |
+| `maxInflight` | Per-account concurrency cap (default `maxInflightPerAccount`) |
+| `deviceProjectDir` | Override the derived fake project dir for this account |
+| `fingerprintSalt` | Per-account fingerprint salt (default: global `fingerprintSalt`) |
+| `enabled` | `false` skips the account without deleting it |
+
+**Pool fields**
+
+| Field | Default | Description |
+|------|--------|-------------|
+| `maxInflightPerAccount` | `32` | Active requests per account (covers the full stream lifetime) |
+| `maxQueuedRequests` | `256` | Requests waiting for a free account; beyond this → `503` |
+| `queueTimeoutMs` | `60000` | Maximum admission wait → `503` |
+| `affinityTtlMs` | `3600000` | How long a conversation stays bound to its account after its last request |
+| `quotaCooldownMs` | `1800000` | Cooldown after `402` / `USAGE_EXCEEDED` |
+| `quarantineMs` | `600000` | Cooldown after `401` / `403` (cleared earlier by a successful health probe) |
+| `healthRefreshMs` | off | `true` = every 60 s, or a positive interval. Probes `GET /alpha/whoami` per account **through its own route** — the same call the CLI makes at session start (no inference quota) |
+| `strictAffinity` | `false` | When a conversation's account is cooling: `false` rebinds it to another account; `true` returns `429` with the remaining cooldown |
+| `passthroughClientKeys` | `true` | A request carrying its own `user_` key bypasses the pool (old single-key behavior); `false` ignores client keys |
+| `diagnostics` | `false` | Enables `GET /pool/stats` |
+| `allowNetwork` | `false` | Permits a non-loopback bind (see warning above) |
+| `allowSharedProxy` | `false` | Permits several accounts on the same proxy endpoint |
+
+**What is isolated per account**
+
+- **Egress:** generate, fingerprint, lifecycle and models requests all go through the account's own proxy. A proxy failure returns `502`; the proxy **never falls back to a direct connection**. Accounts without a proxy each get a dedicated keep-alive agent, so no socket or TLS session is ever shared across accounts.
+- **Device identity:** each account has its own fingerprint, and its project dir is derived per account (`C:\Users\<user>\projects\<name>`, consistent with the fingerprint's OS user), so `x-project-slug` / `workingDir` differ between accounts. The global `deviceProjectDir` is ignored in pool mode.
+- **Session IDs:** a client's `x-session-id` / `prompt_cache_key` is never sent upstream verbatim. Each account sees an HMAC of it keyed by that account, so even a conversation that moves accounts never shows the same session/thread ID on two of them.
+- **State:** fingerprint/lifecycle refresh timers, sessions, the model catalog cache and the timeout counter are per account. Concurrent first requests to an account send **one** fingerprint/lifecycle pair.
+
+**Scheduling and health**
+
+- Accounts are chosen by weighted least in-flight load, with ties broken round-robin. Conversations are sticky: the key is the client session header, then `prompt_cache_key`, then `user` / Anthropic `metadata.user_id`, then a hash of model + system prompt + first user message. Stickiness keeps upstream prompt-cache hits.
+- `429`: cooldown for `Retry-After`, otherwise 5 s doubling up to 60 s. `402` / `USAGE_EXCEEDED` (as an HTTP status or an in-stream error event): `quotaCooldownMs`. `401` / `403`: quarantine. `400` and upstream `5xx` (service-wide capacity) do not cool the account. Transport errors cool it after 3 in a row.
+- **No cross-account replay:** a failing request's error is returned to the client and never retried on another account, so a conversation's content isn't sent to two accounts at once. The client's own retry then lands on a healthy account. The transparent retry on upstream disconnects ([below](#upstream-transient-retry)) stays on the same account.
+- When every account is cooling past the queue budget, the proxy answers `429` with `retry_after` = the earliest recovery, without waiting.
+
+**`GET /pool/stats`** (only with `"diagnostics": true`, `Cache-Control: no-store`) returns per-account `healthy`, `inflight`, `cooldownRemainingMs`, `reason`, `quarantined`, counters and the redacted proxy. It contains no keys, but it does expose account names and health, so keep it behind the same access control as the API.
+
+`/v1/models` uses the catalog of one healthy account (never a union across accounts).
+
+> Restart to apply config changes. The isolation above covers what this proxy controls (identifiers, egress, connections). It is not a guarantee of undetectability: account behavior, timing and content can still correlate accounts.
 
 ## API Endpoints
 
@@ -161,11 +233,11 @@ OpenAI Chat Completions compatible. Supports streaming, non-streaming, tool call
 | `messages` | Yes | Conversation messages, supports `system/user/assistant/tool` roles |
 | `max_tokens` | No | Max tokens to generate (default 64000) |
 | `stream` | No | SSE streaming (default false) |
-| `temperature` | No | Sampling temperature (0-2) |
-| `reasoning_effort` | No | Reasoning intensity: `low`/`medium`/`high`/`max` |
+| `temperature` | No | Accepted but **not sent upstream** — CLI agent turns never send it (see [CLI parity](#cli-parity-command-code1734)) |
+| `reasoning_effort` | No | Snapped to a level the model supports per the CLI capability table; omitted for models without thinking support |
 | `tools` | No | Tool definitions (OpenAI function calling format) |
-| `tool_choice` | No | Tool selection strategy |
-| `parallel_tool_calls` | No | Allow parallel tool calls |
+| `tool_choice` | No | Emulated (never sent): `none` → `tools: []`; a named function → only that tool + a system directive; `required` → system directive |
+| `parallel_tool_calls` | No | Emulated (never sent): `false` → system directive to call one tool at a time |
 
 **Simple request:**
 ```json
@@ -335,6 +407,10 @@ Returns available model list. Fetched dynamically from Provider API (5 min cache
 
 Health check. Returns `OK`.
 
+### `GET /pool/stats`
+
+Account pool diagnostics; only with `"diagnostics": true` in pool mode. See [Account pool](#account-pool-poolconfig--cc_pool_config).
+
 ## Error Codes
 
 Produced by the proxy itself:
@@ -450,20 +526,22 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 
 ## Anti-Detection
 
-Aligned line-by-line against the official npm package source (`command-code@1.53.1`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
+Aligned line-by-line against the official npm package source (`command-code@1.73.4`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
 
 | Mechanism | Implementation |
 |-----------|---------------|
 | **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; signal values (Windows MachineGuid shape, real-shaped MACs, `DESKTOP-xxxxxx` hostname) are **derived deterministically from the API key** and hashed exactly like the CLI, so one key always reports the same device — across restarts, memory reclamation and multiple instances (bulk reset via `CC_FINGERPRINT_SALT`) |
-| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`) sent in parallel with the fingerprint on key init |
+| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`, `sessionId` = `sess_` + first 16 hex of a UUIDv4) sent in parallel with the fingerprint on key init |
+| **Session start** | `GET /alpha/whoami`, then `GET /alpha/billing/subscriptions?orgId=` + `/alpha/billing/credits?orgId=` — the CLI's billing prefetch, with the same headers as generate |
 | **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
-| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.53.1`); newer npm releases only raise a drift **warning**, never a silent version bump |
-| **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
+| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.73.4`); newer npm releases only raise a drift **warning**, never a silent version bump |
+| **CLI Envelope** | Key order `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params`; agent turns omit `mode` and `promptCache` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"`, `User-Agent: cli` |
+| **Headers** | Same keys, order and casing as the CLI, including its quirk `content-type: application/json, application/json` (transport + auth headers both set it); `User-Agent: cli` on generate, fingerprint and lifecycle; `x-taste-learning: "false"` (configurable) |
+| **Transport** | Native `fetch` (undici) everywhere, as in the CLI — pooled accounts too, through their own undici `Agent` — so default headers (`accept`, `accept-encoding`, `sec-fetch-mode`, …) match |
 | **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)` — same source as `config.workingDir` (default `C:\Users\dev\projects\app`, override with `CC_DEVICE_PROJECT_DIR`) |
 | **Single Source of Device Truth** | Fingerprint / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle `os` all read one `DEVICE_PROFILE` (`win32` / `x64`) — so they cannot contradict each other ("fingerprint says win32, environment says linux"), and the host's real platform, Node version and cwd are never handed upstream |
-| **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
+| **Reasoning Effort** | Gated by the CLI 1.73.4 capability table: sent only for thinking-capable models, snapped to a supported level |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
@@ -492,9 +570,12 @@ Aligned line-by-line against the official npm package source (`command-code@1.53
   "taste": null,
   "skills": null,
   "permissionMode": "standard",
+  "threadId": "8c0e…-uuid",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
     "messages": [...],
+    "tools": [],
+    "system": [{ "type": "text", "text": "…" }],
     "max_tokens": 64000,
     "stream": true,
     "reasoning_effort": "max"
@@ -504,7 +585,35 @@ Aligned line-by-line against the official npm package source (`command-code@1.53
 
 `config.environment` and `config.workingDir` come from `DEVICE_PROFILE` (not from the host), and `skills` is `null` (not an empty string).
 
-Conditional fields: `system` (extracted from `system` messages), `temperature`, `reasoning_effort`, `tools` (mapped to CC `input_schema` format), `tool_choice`, `parallel_tool_calls`. When a `prompt_cache_key` is present (or the client already set `cache_control`), the breakpoint lands on the last system block — caching is prefix-based and system is that prefix.
+`params` keys are in the CLI's order. `tools` is always present (`[]` without tools). `reasoning_effort` is only sent when the model supports thinking. `temperature`, `tool_choice` and `parallel_tool_calls` are never sent. When a `prompt_cache_key` is present, the cache breakpoint lands on the last system block, the only place the CLI ever sends `cache_control`.
+
+### CLI parity (`command-code@1.73.4`)
+
+**Outgoing** (what is sent to `/alpha/generate`), mirroring `createModelClient` / `toWireMessages`:
+
+- **Messages:** user parts are only `{type:"text"}` / `{type:"image", image, mimeType}`, so client extras like message-level `cache_control` are dropped. All tool results of one turn go in **one** `role:"tool"` message, and tool output is the text parts joined with `\n`. Assistant parts are `reasoning`, `text` and `tool-call`.
+- **Tool names:** `tool_search` is sent as `search_tools` (the CLI's only rewrite) in definitions and history, and mapped back to `tool_search` in responses. It is skipped when a client defines both names.
+- **Client controls the CLI never sends** are emulated with constructs the CLI does send:
+  - `tool_choice: "none"` → `tools: []`
+  - forced function → only that tool plus a system directive
+  - `required` → a system directive
+  - `parallel_tool_calls: false` → a system directive
+  - `temperature` has no CLI equivalent and is dropped.
+- **Capabilities:** `reasoning_effort` follows the CLI's built-in table. For example, DeepSeek V4 accepts `off/high/max`, Claude `low…max`, and Kimi K2.6 none. OpenAI `minimal`/`none` map to `low`/`off`. Models unknown to the CLI get no effort. For text-only models (DeepSeek V4, GLM-5.x, …), images are replaced exactly like the CLI's `stripImages`: numbered `<attached_image>` markers in the last image message, and earlier images removed.
+
+**Incoming** (what the stream is normalized to), mirroring `consumeStream`:
+
+- Server-executed tool calls (`providerExecuted: true`) and `tool-result` events are not forwarded as client tool calls.
+- `abort` ends the response normally, and `cache-write-tokens` is ignored.
+- Tool-call inputs are repaired the CLI's way (`coerceToolInput`): unwrap one-element arrays, parse JSON strings, wrap a bare string into a single required field.
+- Stream `error` events accept a bare string and the CLI's embedded form `429 {"error":{…}}`.
+- `premium_credits_exhausted` / `insufficient credits` become a non-retryable quota error (`429`, `code: INSUFFICIENT_CREDITS`; pooled accounts cool down). `model_not_in_plan` becomes `400`.
+
+**Not mirrored (intentional):**
+
+- The CLI retries 408/429/5xx itself, up to 10 times, and restarts broken streams even after output. The proxy retries only transport failures before the first byte and leaves the rest to clients and the account pool.
+- The CLI re-sends the request on `pause_turn` (up to 5 times). The proxy reports it as incomplete.
+- `config.structure` is `[]` (an empty project directory) instead of a real `readdir`.
 
 ### CC API Image Message Format
 

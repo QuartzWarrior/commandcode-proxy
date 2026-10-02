@@ -7,3 +7,4 @@ node_modules/
 temp/
 README*.md
 AGENTS.md
+pool.json

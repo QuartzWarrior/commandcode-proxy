@@ -1,0 +1,24 @@
+{
+  "accounts": [
+    {
+      "name": "alice",
+      "apiKeyEnv": "CC_KEY_ALICE",
+      "proxyEnv": "CC_PROXY_ALICE"
+    },
+    {
+      "name": "bob",
+      "apiKeyEnv": "CC_KEY_BOB",
+      "proxyEnv": "CC_PROXY_BOB",
+      "weight": 2
+    }
+  ],
+  "maxInflightPerAccount": 32,
+  "maxQueuedRequests": 256,
+  "queueTimeoutMs": 60000,
+  "quotaCooldownMs": 1800000,
+  "healthRefreshMs": false,
+  "strictAffinity": false,
+  "passthroughClientKeys": true,
+  "diagnostics": false,
+  "allowNetwork": false
+}

@@ -2,11 +2,11 @@
 
 > [English Docs](README.md)
 
-将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
+将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。零外部依赖。
 
-逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
+逐条对齐官方 npm 包源码（`command-code@1.73.4`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
-**完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志 | **多账号池**（每账号独立代理、负载均衡、相互隔离）
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -33,7 +33,9 @@ commandcode/
 ├── config.json           # 端口 / 日志路径等
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # 单文件核心代理（~1900 行）
+├── proxy.mjs             # 核心代理（协议转换、各接口处理）
+├── pool.mjs              # 账号池：调度、健康、每账号出口、配置校验
+├── pool.example.json     # 账号池配置模板（复制为 pool.json 并 chmod 600）
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
@@ -58,14 +60,16 @@ commandcode/
 | `apiKey` | `""` | 可选兜底 API Key（请求也可通过 header 传入） |
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
 | `logLevel` | `info` | 日志级别 |
-| `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
+| `useProviderModels` | `false` | 从 `/provider/v1/models` 拉模型列表。默认关：真 CLI 从不调这个端点（目录内置），`/v1/models` 返回 CLI 1.73.4 的内置目录 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `zdr` | `false` | 请求 Command Code 使用 ZDR-only 路由 |
-| `cliMode` | `agent` | 信封 `mode`。上游枚举：`agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
+| `cliMode` | `""`（不带）| 信封 `mode`。CLI 1.73.4 的 agent 回合**不带** `mode` 键；只有想模仿功能调用时才设。上游枚举：`agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
+| `tasteLearning` | `false` | `x-taste-learning` 头。CLI 默认 `true`（服务端会从账号的对话里学习「口味」档案），这里默认关 |
 | `cliSessionMode` | `interactive` | lifecycle 元数据里的 `mode`（**另一个枚举**：`interactive` / `non-interactive`）|
 | `fingerprintSalt` | `""` | 设备指纹的盐。**成批换设备身份**就用它（同一个 key 永远报同一台设备）|
 | `deviceProjectDir` | `""` | 伪装的项目目录（空则用内置 `C:\Users\dev\projects\app`）；改了 = 所有账号换一台设备 |
 | `emptySystemPlaceholder` | `true` | 无 system prompt 时发空格占位，阻止上游注入约 7.5K token 默认提示词（[#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)）|
+| `poolConfig` | `""` | 私有账号池配置文件路径（相对 `proxy.mjs`）；设置即开启账号池模式，见[账号池](#账号池poolconfig--cc_pool_config) |
 
 ### 环境变量
 
@@ -74,12 +78,15 @@ commandcode/
 | `PORT` | `3000`（自带 config.json 为 `3050`）| 监听端口 → `port` |
 | `HOST` | `0.0.0.0` | 监听地址 → `host` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | 上游地址 → `apiBase` |
-| `CC_UPSTREAM_PROXY` | 空 | 让**发往 CC 上游**的请求走 HTTP 代理（仅 `http://` CONNECT），见下文「上游代理」→ `upstreamProxy` |
+| `CC_UPSTREAM_PROXY` | 空 | 让**发往 CC 上游**的请求走 `http://`（CONNECT）或 `https://` 代理，见下文「上游代理」→ `upstreamProxy` |
+| `CC_POOL_CONFIG` | 空 | 账号池配置路径（相对当前工作目录）→ `poolConfig` |
+| `CC_POOL_ALLOW_NETWORK` | 空 | `1` 允许账号池模式绑定非回环地址（没有客户端鉴权！）|
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | 空 | 日志文件 → `logFile`（**同步写**，见[其它注意事项](#其它注意事项)）|
-| `CC_USE_PROVIDER_MODELS` | `true` | 动态拉取模型列表 → `useProviderModels` |
+| `CC_USE_PROVIDER_MODELS` | `false` | `true` = 从 `/provider/v1/models` 拉模型列表 → `useProviderModels` |
 | `CMD_ZDR` | 关 | `1` 开启 ZDR-only 路由 → `zdr` |
-| `CC_CLI_MODE` | `agent` | 信封 `mode` → `cliMode` |
+| `CC_CLI_MODE` | 空（不带）| 信封 `mode` → `cliMode` |
+| `CC_TASTE_LEARNING` | `false` | `true` = 发 `x-taste-learning: true` → `tasteLearning` |
 | `CC_CLI_SESSION_MODE` | `interactive` | lifecycle 元数据的 `mode` → `cliSessionMode` |
 | `CC_FINGERPRINT_SALT` | 空 | 设备指纹盐 → `fingerprintSalt` |
 | `CC_DEVICE_PROJECT_DIR` | 空 | 伪装的项目目录 → `deviceProjectDir` |
@@ -133,14 +140,79 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 ```
 
-- 作用于 `/alpha/generate`、`/alpha/fingerprint/record`、`/alpha/lifecycle-events` 与 `/provider/v1/models`。
+- 作用于全部上游请求：`/alpha/generate`、`/alpha/fingerprint/record`、`/alpha/lifecycle-events`、`/alpha/whoami`、`/alpha/billing/*`，以及（开启时的）`/provider/v1/models`。
 - **不影响**本地监听、`/health` 与 npm 版本检查。
-- 仅支持 `http://`（CONNECT）代理。实现方式是自建 CONNECT 隧道 + `node:https` 复用同一 socket，**不新增任何依赖**，Node 18+ 即可用。
+- 支持 `http://`（CONNECT）与 `https://`（先与代理建 TLS 再 CONNECT）代理。实现方式是自建 CONNECT 隧道 + `node:https` 复用同一 socket，**不新增任何依赖**，Node 18+ 即可用。
 - 每个上游请求各自建立一条隧道连接。TLS 为端到端：证书按**目标主机名**校验，绝不针对代理降级。
 - **指纹/lifecycle 预请求也走代理**是刻意的：若它们直连而上游生成走代理，同一账号会从两个不同 IP 注册 —— 正是你想避免的那种矛盾。
 - 代理地址里带账号密码（`http://user:pass@host:port`）时，日志只保留 `host:port`，**不打印口令**。
 
 > Node 原生 `fetch` **不读** `HTTPS_PROXY`/`HTTP_PROXY`。官方环境变量路线需要 Node ≥ 22.21 / 24.5 且设 `NODE_USE_ENV_PROXY=1`；本选项两者都不需要。
+
+### 账号池（`poolConfig` / `CC_POOL_CONFIG`）
+
+**一个端点背后挂多个 Command Code 账号**：每个账号独立的 key、独立的出口代理、独立的设备身份，账号之间相互隔离；请求在健康账号之间负载均衡，同一会话固定在同一账号上。设计移植自 [openai-oauth fork](https://github.com/QuartzWarrior/openai-oauth) 的账号池。
+
+```bash
+cp pool.example.json pool.json && chmod 600 pool.json   # 里面有 key：不能对他人可读
+export CC_KEY_ALICE=user_xxx CC_PROXY_ALICE=http://user:pass@proxy-a.example:8080
+export CC_KEY_BOB=user_yyy   CC_PROXY_BOB=https://proxy-b.example:443
+HOST=127.0.0.1 CC_POOL_CONFIG=./pool.json npm start
+```
+
+之后客户端调用代理时**不带** API key（或带任意非 `user_` 的 token），由代理挑账号。
+
+> ⚠️ **账号池模式没有客户端鉴权**：能连上端口的人就能用池里所有账号。因此在非回环地址上**默认拒绝启动**，除非设置 `"allowNetwork": true` 或 `CC_POOL_ALLOW_NETWORK=1`。只在可信网络、或前面自加鉴权 / TLS 时这样做（Docker 需要，因为容器绑 `0.0.0.0`）。账号池不是多租户隔离边界。
+
+**账号字段**
+
+| 字段 | 说明 |
+|------|------|
+| `name` | 必填、唯一。用于日志与 `/pool/stats`（key 永不入日志）|
+| `apiKey` / `apiKeyEnv` | `user_…` key，直接写或从环境变量读（二选一）。重复的 key 拒绝启动 |
+| `proxy` / `proxyEnv` | 可选的该账号出口：`http://`（CONNECT）或 `https://`（先与代理建 TLS 再 CONNECT）。两个账号用同一代理 host:port **且**口令相同会被拒绝，除非 `allowSharedProxy` |
+| `weight` | 负载权重（默认 `1`）|
+| `maxInflight` | 该账号并发上限（默认 `maxInflightPerAccount`）|
+| `deviceProjectDir` | 覆盖该账号派生出的伪装项目目录 |
+| `fingerprintSalt` | 该账号的指纹盐（默认用全局 `fingerprintSalt`）|
+| `enabled` | `false` 暂时跳过该账号而不删配置 |
+
+**池字段**
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `maxInflightPerAccount` | `32` | 每账号在途请求数（覆盖整个流的生命周期）|
+| `maxQueuedRequests` | `256` | 等待空闲账号的请求数上限；超出 → `503` |
+| `queueTimeoutMs` | `60000` | 最长排队时间 → `503` |
+| `affinityTtlMs` | `3600000` | 会话最后一次请求后与账号保持绑定的时长 |
+| `quotaCooldownMs` | `1800000` | `402` / `USAGE_EXCEEDED` 后的冷却 |
+| `quarantineMs` | `600000` | `401` / `403` 后的冷却（健康探测成功会提前解除）|
+| `healthRefreshMs` | 关 | `true` = 每 60 秒，或正整数间隔。经**各账号自己的路由**探测 `GET /alpha/whoami` —— CLI 每次开会话都会调的同一个请求（不耗推理额度）|
+| `strictAffinity` | `false` | 会话所属账号冷却中：`false` 改派到别的账号；`true` 回 `429` 并带剩余冷却时间 |
+| `passthroughClientKeys` | `true` | 自带 `user_` key 的请求绕过账号池（即原来的单 key 行为）；`false` 忽略客户端 key |
+| `diagnostics` | `false` | 开启 `GET /pool/stats` |
+| `allowNetwork` | `false` | 允许绑定非回环地址（见上方警告）|
+| `allowSharedProxy` | `false` | 允许多个账号共用同一代理出口 |
+
+**每个账号独立的东西**
+
+- **出口**：generate、指纹、lifecycle、models 请求全部走该账号自己的代理。代理挂了回 `502`，**绝不回落直连**。没配代理的账号各自有专属的 keep-alive Agent，账号之间不会共用 socket 或 TLS 会话。
+- **设备身份**：每个账号有自己的指纹，项目目录也按账号派生（`C:\Users\<用户名>\projects\<名字>`，用户名与指纹里的 OS 用户一致），所以各账号的 `x-project-slug` / `workingDir` 都不同。池模式下忽略全局 `deviceProjectDir`。
+- **会话 id**：客户端的 `x-session-id` / `prompt_cache_key` 不原样上送，每个账号看到的是以该账号为密钥的 HMAC。即使会话被改派，两个账号也不会出现同一个 session/thread id。
+- **状态**：指纹 / lifecycle 刷新计时、会话、模型目录缓存、超时计数都按账号独立。同一账号的并发首请求只发**一组**指纹 / lifecycle 预请求。
+
+**调度与健康**
+
+- 按加权最少在途挑账号，平局轮转。会话粘性的键依次取：客户端会话 header → `prompt_cache_key` → `user` / Anthropic `metadata.user_id` → 模型 + system + 首条用户消息的哈希。粘性也能保住上游 prompt cache 命中。
+- `429`：冷却 `Retry-After` 指定的时长，没有则 5 秒起翻倍、封顶 60 秒。`402` / `USAGE_EXCEEDED`（HTTP 状态码或流内 error 事件）：冷却 `quotaCooldownMs`。`401` / `403`：隔离。`400` 与上游 `5xx`（全服务级容量问题）不冷却账号。传输层错误连续 3 次才冷却。
+- **不跨账号重放**：失败请求的错误交还给客户端，绝不换个账号重试，免得同一段对话内容同时发往两个账号。客户端自己重试时会落到健康账号上。上游闪断的透明重试（[见下文](#上游闪断重试)）留在同一账号。
+- 所有账号都在冷却、且最早恢复时间超出排队预算时，直接回 `429`，`retry_after` = 最早恢复时间，不白等。
+
+**`GET /pool/stats`**（仅 `"diagnostics": true` 时开启，`Cache-Control: no-store`）返回每个账号的 `healthy`、`inflight`、`cooldownRemainingMs`、`reason`、`quarantined`、计数器与脱敏后的代理地址。不含 key，但会暴露账号名与健康状况，请放在与 API 相同的访问控制之后。
+
+`/v1/models` 使用某一个健康账号的模型目录（绝不把多个账号的目录合并）。
+
+> 改配置需重启生效。以上隔离只覆盖本代理能控制的部分（标识、出口、连接），不是「不可检测」的保证：账号的使用行为、时间规律和内容仍可能把账号关联起来。
 
 ## API 接口
 
@@ -156,11 +228,11 @@ OpenAI Chat Completions 兼容。支持流式和非流式、工具调用、多�
 | `messages` | 是 | 对话消息，支持 `system/user/assistant/tool` 角色 |
 | `max_tokens` | 否 | 最大生成 token（默认 64000） |
 | `stream` | 否 | 是否 SSE 流式（默认 false） |
-| `temperature` | 否 | 采样温度（0-2）|
-| `reasoning_effort` | 否 | 推理强度 `low`/`medium`/`high`/`max` |
+| `temperature` | 否 | 接受但**不上送** —— CLI 的 agent 回合从不发（见 [CLI 对齐](#cli-对齐command-code1734)）|
+| `reasoning_effort` | 否 | 按 CLI 能力表吸附到该模型受支持的档位；不支持思考的模型不发 |
 | `tools` | 否 | 工具定义（OpenAI function calling 格式）|
-| `tool_choice` | 否 | 工具选择策略 |
-| `parallel_tool_calls` | 否 | 是否允许并行工具调用 |
+| `tool_choice` | 否 | 模拟实现（从不上送）：`none` → `tools: []`；指定函数 → 只发该工具 + 系统指令；`required` → 系统指令 |
+| `parallel_tool_calls` | 否 | 模拟实现（从不上送）：`false` → 系统指令「一次只调一个工具」|
 
 **简单请求：**
 ```json
@@ -330,6 +402,10 @@ curl http://127.0.0.1:3050/v1/responses \
 
 健康检查。返回 `OK`。
 
+### `GET /pool/stats`
+
+账号池诊断；仅在账号池模式且 `"diagnostics": true` 时开启。见[账号池](#账号池poolconfig--cc_pool_config)。
+
 ## 错误码
 
 代理自己产生的：
@@ -450,15 +526,17 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | 机制 | 实现 |
 |------|------|
 | **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；信号值（Windows MachineGuid 形状、真实形状的 MAC、`DESKTOP-xxxxxx` 主机名）由 API key **确定性派生**，并按 CLI 的算法哈希 —— 同一个 key 永远报告同一台设备：重启、内存回收、多实例都一致（用 `CC_FINGERPRINT_SALT` 成批换身份）|
-| **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`）|
+| **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`，`sessionId` = `sess_` + UUIDv4 去横线前 16 位）|
+| **会话开始** | `GET /alpha/whoami`，再 `GET /alpha/billing/subscriptions?orgId=` + `/alpha/billing/credits?orgId=` —— CLI 的 billing 预取，头与 generate 相同 |
 | **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
-| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.53.1`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
-| **CLI 信封格式** | 9 键：`config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
+| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.73.4`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
+| **CLI 信封格式** | 键序 `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params`；agent 回合不带 `mode` 与 `promptCache` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"`、`User-Agent: cli` |
+| **请求头** | 键、顺序、大小写与 CLI 一致，包括它的怪癖 `content-type: application/json, application/json`（传输层与鉴权头各设一次）；generate / 指纹 / lifecycle 都带 `User-Agent: cli`；`x-taste-learning: "false"`（可配）|
+| **传输** | 与 CLI 一样全程用原生 `fetch`（undici）—— 池账号也是，各用自己的 undici `Agent` —— 默认头（`accept`、`accept-encoding`、`sec-fetch-mode` …）一致 |
 | **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)`，与 `config.workingDir` 同源（默认 `C:\Users\dev\projects\app`，用 `CC_DEVICE_PROJECT_DIR` 改）|
 | **设备档案单一真源** | 指纹 / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle 的 `os` 共用同一份 `DEVICE_PROFILE`（`win32` / `x64`）—— 既不会自相矛盾（"指纹说 win32、环境说 linux"），也不把宿主真实平台、Node 版本、cwd 交给上游 |
-| **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
+| **思考强度** | 按 CLI 1.73.4 能力表：只对支持思考的模型发送，并吸附到受支持的档位 |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
@@ -487,9 +565,12 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
   "taste": null,
   "skills": null,
   "permissionMode": "standard",
+  "threadId": "8c0e…-uuid",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
     "messages": [...],
+    "tools": [],
+    "system": [{ "type": "text", "text": "…" }],
     "max_tokens": 64000,
     "stream": true,
     "reasoning_effort": "max"
@@ -499,7 +580,35 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 
 `config.environment` / `config.workingDir` 都取自 `DEVICE_PROFILE`（不是宿主真实值），`skills` 发 `null`（不是空串）。
 
-条件字段：`system`（从 system 消息提取）、`temperature`、`reasoning_effort`、`tools`（映射为 CC `input_schema` 格式）、`tool_choice`、`parallel_tool_calls`。给了 `prompt_cache_key`（或客户端自带 `cache_control` 断点）时，断点会落在 system 的最后一块上 —— 缓存按前缀计，system 正是最前那段前缀。
+`params` 键序与 CLI 一致。`tools` 总是存在（没有工具时为 `[]`）。`reasoning_effort` 只在模型支持思考时发送。`temperature`、`tool_choice`、`parallel_tool_calls` 从不发送。给了 `prompt_cache_key` 时，缓存断点落在 system 最后一块 —— 这也是 CLI 唯一会发 `cache_control` 的位置。
+
+### CLI 对齐（`command-code@1.73.4`）
+
+**上行**（发往 `/alpha/generate` 的内容），对齐 `createModelClient` / `toWireMessages`：
+
+- **消息**：user 部件只有 `{type:"text"}` / `{type:"image", image, mimeType}`，客户端附带的消息级 `cache_control` 等字段会被丢掉。同一回合的全部工具结果合成**一条** `role:"tool"` 消息，工具输出取文本块并用 `\n` 拼接。assistant 部件为 `reasoning`、`text`、`tool-call`。
+- **工具名**：`tool_search` 上送为 `search_tools`（CLI 唯一的重写），工具定义与历史都改，响应里再改回 `tool_search`。客户端两个名字都定义了时不重写。
+- **CLI 从不发的客户端控制项**，用 CLI 本身会发的结构模拟：
+  - `tool_choice: "none"` → `tools: []`
+  - 强制某函数 → 只发该工具 + 系统指令
+  - `required` → 系统指令
+  - `parallel_tool_calls: false` → 系统指令
+  - `temperature` 在 CLI 里没有等价物，直接丢弃。
+- **能力**：`reasoning_effort` 按 CLI 内置能力表处理。例如 DeepSeek V4 接受 `off/high/max`，Claude 接受 `low…max`，Kimi K2.6 不接受。OpenAI 的 `minimal`/`none` 映射为 `low`/`off`。CLI 不认识的模型不发档位。纯文本模型（DeepSeek V4、GLM-5.x 等）的图片按 CLI 的 `stripImages` 处理：最后一条带图消息里的图换成带序号的 `<attached_image>` 标记，更早的图去掉。
+
+**下行**（流事件的整形），对齐 `consumeStream`：
+
+- 服务端执行的工具调用（`providerExecuted: true`）与 `tool-result` 事件不会当作客户端工具调用转出。
+- `abort` 视为正常结束，`cache-write-tokens` 忽略。
+- 工具调用输入按 CLI 的 `coerceToolInput` 修整：单元素数组解包、JSON 字符串解析、裸字符串包进唯一的必填字段。
+- 流内 `error` 事件兼容裸字符串，以及 CLI 的内嵌形态 `429 {"error":{…}}`。
+- `premium_credits_exhausted` / `insufficient credits` 视为不可重试的额度错误（`429`，`code: INSUFFICIENT_CREDITS`；池账号会冷却）。`model_not_in_plan` 视为 `400`。
+
+**有意不照搬**：
+
+- CLI 会自己重试 408/429/5xx（最多 10 次），输出中途断流也会重启。代理只在首字节之前重试传输层失败，其余交给客户端与账号池。
+- CLI 遇到 `pause_turn` 会重发请求（最多 5 次），代理按「不完整」上报。
+- `config.structure` 发 `[]`（空项目目录），而不是真实的目录列表。
 
 ### CC API 图片消息格式
 

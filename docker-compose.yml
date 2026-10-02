@@ -7,6 +7,16 @@ services:
       - "${PROXY_PORT:-3050}:3050"
     environment:
       PORT: "3050"
+      # ── Account pool (optional) ──────────────────────────────
+      # Mount a private pool config (chmod 600 on the host) and point CC_POOL_CONFIG at it.
+      # Pool mode has no client auth: it refuses a non-loopback bind unless
+      # CC_POOL_ALLOW_NETWORK=1. Only publish the port to a trusted network or put auth in front.
+      # CC_POOL_CONFIG: /run/secrets/pool.json
+      # CC_POOL_ALLOW_NETWORK: "1"
+      # CC_KEY_ALICE: user_xxx
+      # CC_PROXY_ALICE: http://user:pass@proxy-a.example:8080
+    # volumes:
+    #   - ./pool.json:/run/secrets/pool.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "http://127.0.0.1:3050/health"]

@@ -11,6 +11,9 @@ import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import {
+  createPool, createUpstreamFetch, loadPoolConfig, parseProxyUrl, parseRetryAfterMs, redactProxyUrl,
+} from './pool.mjs';
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -23,15 +26,17 @@ function loadConfig() {
     projectSlug: 'cc-proxy',
     logFile: '',
     logLevel: 'info',
-    useProviderModels: true,
+    useProviderModels: false,   // CLI 从不调 /provider/v1/models（模型目录内置在 CLI 里）；默认用内置的 1.73.4 目录
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
-    cliMode: 'agent', // 信封 mode。服务端枚举（真机 400 报出来的）：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
+    cliMode: '', // 信封 mode。留空 = 不带（CLI 1.73.4 的 agent 回合就不带）。服务端枚举：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
+    tasteLearning: false,       // x-taste-learning。CLI 默认 true（会让服务端从对话里学习「口味」写进账号）；这里默认关
     cliSessionMode: 'interactive', // lifecycle metadata 的 mode —— 注意这是另一个枚举：interactive | non-interactive
     fingerprintSalt: '',
     deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
+    poolConfig: '',               // 账号池私有配置文件路径（见 README「账号池」）；留空 = 单 key 模式
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -54,17 +59,21 @@ function loadConfig() {
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.CC_FINGERPRINT_SALT !== undefined) defaults.fingerprintSalt = process.env.CC_FINGERPRINT_SALT;
   if (process.env.CC_DEVICE_PROJECT_DIR) defaults.deviceProjectDir = process.env.CC_DEVICE_PROJECT_DIR;
-  if (process.env.CC_CLI_MODE) defaults.cliMode = process.env.CC_CLI_MODE;
+  if (process.env.CC_CLI_MODE !== undefined) defaults.cliMode = process.env.CC_CLI_MODE;
+  if (process.env.CC_TASTE_LEARNING !== undefined) defaults.tasteLearning = process.env.CC_TASTE_LEARNING === 'true';
   if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
+  // 环境变量给的相对路径按当前工作目录解析，config.json 里的按 proxy.mjs 所在目录解析
+  if (process.env.CC_POOL_CONFIG) defaults.poolConfig = resolve(process.cwd(), process.env.CC_POOL_CONFIG);
+  else if (defaults.poolConfig) defaults.poolConfig = resolve(__dirname, defaults.poolConfig);
 
   return defaults;
 }
 
 const CFG = loadConfig();
 
-// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1 起未变，1.73.4 复核一致） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
   { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },   // TEMP-REVERT
@@ -109,18 +118,18 @@ const FP_MAIL_DOMAINS = ['gmail.com', 'outlook.com', 'qq.com', '163.com'];
 
 // 伪造信号的派生源。加 CC_FINGERPRINT_SALT 可成批换身份 —— 真实账号的 key 动不了，这是逃生口。
 // 注意：哈希阶段用的是 CLI 的固定盐（FP_SALT），salt 只影响「伪造出哪台机器」。
-function fpDigest(apiKey, field) {
+function fpDigest(apiKey, field, salt = CFG.fingerprintSalt) {
   return crypto.createHash('sha256')
-    .update(`${CFG.fingerprintSalt || ''}\0${apiKey}\0${field}`)
+    .update(`${salt || ''}\0${apiKey}\0${field}`)
     .digest();
 }
 // 从候选池确定性地挑一项：打分取最大。以后往池里加候选只影响「新候选恰好胜出」的那部分 key，
 // 不会像取模那样因为池长度变化让所有 key 一起换设备。
-function fpPickIndex(apiKey, field, items, labelOf) {
+function fpPickIndex(apiKey, field, items, labelOf, salt = CFG.fingerprintSalt) {
   let bestIdx = 0;
   let bestScore = null;
   for (let i = 0; i < items.length; i++) {
-    const score = fpDigest(apiKey, `${field}\0${labelOf(i)}`);
+    const score = fpDigest(apiKey, `${field}\0${labelOf(i)}`, salt);
     if (!bestScore || Buffer.compare(score, bestScore) > 0) { bestScore = score; bestIdx = i; }
   }
   return bestIdx;
@@ -136,20 +145,20 @@ function fingerprintHash(value) {
 // os.userInfo、git config），这里按 apiKey 确定性地伪造一组逼真值。
 // 为什么必须由 apiKey 派生而不是随机：指纹代表「这个账号对应的那台设备」，重启、内存回收、
 // 多实例、月额度用尽停用数周后恢复，上游都应看到同一台设备；换指纹本身就是可疑信号。
-function generateFingerprint(apiKey) {
-  const cpuEntry = FINGERPRINT_CPUS[fpPickIndex(apiKey, 'cpu', FINGERPRINT_CPUS, i => `${FINGERPRINT_CPUS[i].model}|${FINGERPRINT_CPUS[i].cores}`)];
-  const memGiB = FINGERPRINT_MEMS[fpPickIndex(apiKey, 'mem', FINGERPRINT_MEMS, i => String(FINGERPRINT_MEMS[i]))];
-  const tz = FINGERPRINT_TZS[fpPickIndex(apiKey, 'timezone', FINGERPRINT_TZS, i => FINGERPRINT_TZS[i])];
-  const macCount = FINGERPRINT_MAC_COUNT_RANGE[fpPickIndex(apiKey, 'macCount', FINGERPRINT_MAC_COUNT_RANGE, i => String(FINGERPRINT_MAC_COUNT_RANGE[i]))];
-  const osUser = FP_OS_USERS[fpPickIndex(apiKey, 'osUser', FP_OS_USERS, i => FP_OS_USERS[i])];
-  const mailDomain = FP_MAIL_DOMAINS[fpPickIndex(apiKey, 'mailDomain', FP_MAIL_DOMAINS, i => FP_MAIL_DOMAINS[i])];
-  const hex = (field, bytes) => fpDigest(apiKey, field).subarray(0, bytes).toString('hex');
+function generateFingerprint(apiKey, salt = CFG.fingerprintSalt) {
+  const cpuEntry = FINGERPRINT_CPUS[fpPickIndex(apiKey, 'cpu', FINGERPRINT_CPUS, i => `${FINGERPRINT_CPUS[i].model}|${FINGERPRINT_CPUS[i].cores}`, salt)];
+  const memGiB = FINGERPRINT_MEMS[fpPickIndex(apiKey, 'mem', FINGERPRINT_MEMS, i => String(FINGERPRINT_MEMS[i]), salt)];
+  const tz = FINGERPRINT_TZS[fpPickIndex(apiKey, 'timezone', FINGERPRINT_TZS, i => FINGERPRINT_TZS[i], salt)];
+  const macCount = FINGERPRINT_MAC_COUNT_RANGE[fpPickIndex(apiKey, 'macCount', FINGERPRINT_MAC_COUNT_RANGE, i => String(FINGERPRINT_MAC_COUNT_RANGE[i]), salt)];
+  const osUser = fpOsUser(apiKey, salt);
+  const mailDomain = FP_MAIL_DOMAINS[fpPickIndex(apiKey, 'mailDomain', FP_MAIL_DOMAINS, i => FP_MAIL_DOMAINS[i], salt)];
+  const hex = (field, bytes) => fpDigest(apiKey, field, salt).subarray(0, bytes).toString('hex');
   // Windows MachineGuid 形状：8-4-4-4-12
   const mid = hex('machineId', 16);
   const machineId = `${mid.slice(0, 8)}-${mid.slice(8, 12)}-${mid.slice(12, 16)}-${mid.slice(16, 20)}-${mid.slice(20, 32)}`;
   const macs = [];
   for (let i = 0; i < macCount; i++) {
-    const b = fpDigest(apiKey, `mac${i}`).subarray(0, 6);
+    const b = fpDigest(apiKey, `mac${i}`, salt).subarray(0, 6);
     macs.push([...b].map(x => x.toString(16).padStart(2, '0')).join(':'));
   }
   macs.sort(); // CLI 对 MAC 去重后排序
@@ -189,11 +198,26 @@ function generateFingerprint(apiKey) {
   };
 }
 
-// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.53.1 源码）。
+function fpOsUser(apiKey, salt = CFG.fingerprintSalt) {
+  return FP_OS_USERS[fpPickIndex(apiKey, 'osUser', FP_OS_USERS, i => FP_OS_USERS[i], salt)];
+}
+
+// 账号池里每个账号一台「设备」：全局 DEVICE_PROFILE.projectDir 会让所有账号报同一个项目路径 /
+// x-project-slug —— 这是跨账号的关联信号。池账号的项目目录按 key 确定性派生（用户名与指纹里的
+// osUser 一致），也可在池配置里逐账号覆盖。单 key 模式不走这里，行为不变。
+const FP_PROJECT_NAMES = ['app', 'web', 'api', 'backend', 'frontend', 'server', 'client', 'dashboard',
+  'website', 'service', 'tools', 'core', 'monorepo', 'playground', 'my-app', 'workspace'];
+function deriveDeviceProfile(apiKey, salt, projectDirOverride) {
+  if (projectDirOverride) return { ...DEVICE_PROFILE, projectDir: projectDirOverride };
+  const project = FP_PROJECT_NAMES[fpPickIndex(apiKey, 'projectDir', FP_PROJECT_NAMES, i => FP_PROJECT_NAMES[i], salt)];
+  return { ...DEVICE_PROFILE, projectDir: `C:\\Users\\${fpOsUser(apiKey, salt)}\\projects\\${project}` };
+}
+
+// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.73.4 源码）。
 // 真机发的永远是「形状 + 版本号」自洽的组合；如果版本号跟着 npm 走而形状没变，
 // 就变成「自称最新版、却说旧方言」—— 这比版本号过期更容易被行为分析挑出来。
 // 因此这里报的是协议版本，npm 上更新了只告警、不自动改。
-const CC_PROTOCOL_VERSION = '1.53.1';
+const CC_PROTOCOL_VERSION = '1.73.4';
 let CC_VERSION = CC_PROTOCOL_VERSION;
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
 
@@ -300,7 +324,8 @@ const CLIENT_DRAIN_TIMEOUT_MS = (() => {
 })();
 
 // 连续超时计数：连续 3 次超时才提醒压缩上下文，任意成功请求后重置
-let consecutiveTimeouts = 0;
+// 单 key（透传）模式共用一个计数（行为不变）；账号池里每个账号各计各的，互不影响
+const globalTimeouts = { count: 0 };
 const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
 
 // ── 日志 ─────────────────────────────────────────────
@@ -329,9 +354,9 @@ const SESSION_JITTER_MS  = 60 * 60 * 1000;           // 1h 抖动范围
 
 const sessionStore = new Map(); // apiKey → { sessionId, expiresAt }
 
-function ensureSession(apiKey) {
+function ensureSession(apiKey, store = sessionStore) {
   const now = Date.now();
-  const entry = sessionStore.get(apiKey);
+  const entry = store.get(apiKey);
 
   if (entry && now < entry.expiresAt) {
     return entry.sessionId;
@@ -340,8 +365,8 @@ function ensureSession(apiKey) {
   // 过期或第一次：生成新 session
   const jitter = Math.floor(Math.random() * SESSION_JITTER_MS);
   const sessionId = randomUUID();
-  sessionStore.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter });
-      log('info', 'Session created', { sessionId: sessionId.slice(0, 8), storeSize: sessionStore.size });
+  store.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter });
+  log('info', 'Session created', { sessionId: sessionId.slice(0, 8), storeSize: store.size });
   return sessionId;
 }
 
@@ -359,7 +384,9 @@ setInterval(() => {
   if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
 }, 60 * 60 * 1000); // 每小时
 
-function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function clientSessionIdOf(incomingHeaders, promptCacheKey) {
   // 优先从客户端传来的 session 类 header 获取
   const candidates = [
     incomingHeaders['x-session-id'],
@@ -370,8 +397,27 @@ function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   for (const id of candidates) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
   }
+  return null;
+}
+
+// 账号池：客户端给的会话 id 不原样上送 —— 换成「按账号 key 加盐」的 UUID。
+// 同一会话在同一账号上稳定（缓存照常命中）；会话被改派到别的账号时上游看到的是另一个 id，
+// 两个账号之间不会出现同一个 session/thread id。
+function scopedSessionUuid(apiKey, clientId) {
+  const b = crypto.createHmac('sha256', apiKey).update(`session\0${clientId}`).digest().subarray(0, 16);
+  b[6] = (b[6] & 0x0f) | 0x40; // UUID v4 形状
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = b.toString('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+function getSessionId(incomingHeaders, ctx, promptCacheKey) {
+  const clientId = clientSessionIdOf(incomingHeaders, promptCacheKey);
+  // CLI 的 session id 永远是 UUID（x-session-id 与 threadId 同值）。透传模式下客户端给的 UUID 原样用；
+  // 非 UUID（如 prompt_cache_key 字符串）或池模式 → 派生出一个稳定的 UUID，绝不把非 UUID 形态发上去。
+  if (clientId) return !ctx.pooled && UUID_RE.test(clientId) ? clientId : scopedSessionUuid(ctx.key, clientId);
   // 按 API Key 分 session
-  return ensureSession(apiKey);
+  return ensureSession(ctx.key, ctx.sessions);
 }
 
 // 每个请求独立 thread ID
@@ -398,100 +444,337 @@ function getOrCreateKeyState(apiKey) {
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
 const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
 
-async function ensureInitialized(apiKey, signal) {
-  const state = getOrCreateKeyState(apiKey);
-  const now = Date.now();
-  if (now < state.nextInitAt) return;
+// 同一账号的并发首请求只发一组预请求（真 CLI 一次启动只报一次；N 个并发请求各报一遍本身就可疑）
+async function ensureInitialized(ctx, signal) {
+  const state = ctx.initState;
+  if (Date.now() < state.nextInitAt) return;
+  if (!state.initializing) {
+    state.initializing = runInitialization(ctx, state, signal).finally(() => { state.initializing = null; });
+  }
+  await state.initializing;
+}
 
+// CLI 进程启动时的上游请求序列（对齐 command-code@1.73.4）：
+//   1. setupTelemetry → POST /alpha/lifecycle-events（cli_session_exists）—— 经 createCommandApiClient，
+//      头 = buildCommandApiHeaders：content-type + Content-Type（同样合并成两份）、x-cli-environment、Authorization、
+//      User-Agent: cli、x-command-code-version；启动时还没有活动 span，所以没有 traceparent。
+//      metadata.sessionId = "sess_" + randomUUID 去横线后的前 16 位（第 13 位因此恒为 UUID 版本号 4）。
+//   2. setImmediate → POST /alpha/fingerprint/record —— 头只有 content-type（传输层加的）、Authorization、
+//      x-cli-environment、x-command-code-version、User-Agent: cli（每个进程只报一次）。
+//   3. 会话开始 → createBilling().prefetch()：GET /alpha/whoami，再并行 GET /alpha/billing/subscriptions?orgId=
+//      与 /alpha/billing/credits?orgId=，头与 /alpha/generate 相同（buildCommandAuthHeaders）。
+// 代理长期运行，按「每 8h + 2h 抖动重启一次 CLI」来模拟，每个账号/key 各自一套。
+async function runInitialization(ctx, state, signal) {
+  const upstreamFetch = ctx.fetch;
+  const zdr = CFG.zdr ? { 'x-cmd-zdr': '1' } : {};
+  const fingerprint = state.fingerprint || {};
+  const quiet = (label) => (e) => {
+    if (e.name !== 'AbortError') log('warn', `${label} error`, { error: e.message, ...ctx.logTag });
+  };
+  const drain = (r) => r.body?.cancel().catch(() => {});
   try {
-    // 并行发两个预请求
-    const headers = {
-      'Content-Type': 'application/json',
-      'x-cli-environment': 'production',
-      'Authorization': `Bearer ${apiKey}`,
-      'x-command-code-version': CC_VERSION,
-      ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
-    };
-    const fingerprint = state.fingerprint || {};
-
-    await Promise.all([
-      upstreamFetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
-        method: 'POST', headers, signal,
-        body: JSON.stringify(fingerprint),
-      }).then(r => {
-        if (!r.ok) log('warn', 'Fingerprint record failed', { status: r.status });
-        else log('info', 'Fingerprint recorded');
-      }).catch(e => {
-        if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message });
+    const lifecycle = upstreamFetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
+      method: 'POST',
+      signal,
+      headers: {
+        'content-type': 'application/json',
+        'Content-Type': 'application/json',
+        'x-cli-environment': 'production',
+        'Authorization': `Bearer ${ctx.key}`,
+        'User-Agent': 'cli',
+        'x-command-code-version': CC_VERSION,
+        ...zdr,
+      },
+      body: JSON.stringify({
+        eventType: 'cli_session_exists',
+        metadata: {
+          sessionId: `sess_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
+          cliVersion: CC_VERSION,
+          mode: CFG.cliSessionMode || 'interactive',
+          os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
+        },
       }),
+    }).then(r => {
+      drain(r);
+      if (!r.ok) log('warn', 'Lifecycle event failed', { status: r.status, ...ctx.logTag });
+      else log('info', 'Lifecycle event sent', ctx.logTag);
+    }).catch(quiet('Lifecycle event'));
 
-      upstreamFetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
-        method: 'POST', headers, signal,
-        body: JSON.stringify({
-          eventType: 'cli_session_exists',
-          metadata: {
-            sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
-            cliVersion: CC_VERSION,
-            mode: CFG.cliSessionMode || 'interactive',
-            os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
-          },
-        }),
-      }).then(r => {
-        if (!r.ok) log('warn', 'Lifecycle event failed', { status: r.status });
-        else log('info', 'Lifecycle event sent');
-      }).catch(e => {
-        if (e.name !== 'AbortError') log('warn', 'Lifecycle event error', { error: e.message });
-      }),
-    ]);
+    const fingerprintRecord = upstreamFetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
+      method: 'POST',
+      signal,
+      headers: {
+        'content-type': 'application/json',
+        'Authorization': `Bearer ${ctx.key}`,
+        'x-cli-environment': 'production',
+        'x-command-code-version': CC_VERSION,
+        'User-Agent': 'cli',
+        ...zdr,
+      },
+      body: JSON.stringify({ thumbmark: fingerprint.thumbmark, components: fingerprint.components }),
+    }).then(r => {
+      drain(r);
+      if (!r.ok) log('warn', 'Fingerprint record failed', { status: r.status, ...ctx.logTag });
+      else log('info', 'Fingerprint recorded', ctx.logTag);
+    }).catch(quiet('Fingerprint record'));
+
+    const billing = (async () => {
+      const headers = buildCommandAuthHeaders(ctx, ensureSession(ctx.key, ctx.sessions));
+      const get = async (route) => {
+        const r = await upstreamFetch(`${CFG.apiBase}${route}`, { method: 'GET', headers, signal });
+        const text = await r.text().catch(() => '');
+        if (!r.ok) throw new Error(`GET ${route.split('?')[0]} → ${r.status}`);
+        try { return JSON.parse(text); } catch { return null; }
+      };
+      const who = await get('/alpha/whoami');
+      const orgId = who?.org?.id ?? null;
+      const q = orgId == null ? '' : `?${new URLSearchParams({ orgId })}`;
+      await Promise.all([get(`/alpha/billing/subscriptions${q}`), get(`/alpha/billing/credits${q}`)]);
+    })().catch(quiet('Billing prefetch'));
+
+    await Promise.all([lifecycle, fingerprintRecord, billing]);
 
     // 成功：8h + 2h 随机抖动
     const jitter = Math.floor(Math.random() * INIT_JITTER_MS);
     state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter;
-    log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h` });
+    log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h`, ...ctx.logTag });
   } catch (e) {
     if (e.name !== 'AbortError') log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e.message });
   }
 }
 
-// ── 模型列表 ───────────────────────────────────────
+// ── CLI 1.73.4 模型能力表（由 command-code@1.73.4 dist/cli.mjs 的内置常量提取）──
+// efforts = getSupportedEfforts 用的表（br）：有表 = 支持思考；值 = 该模型接受的 reasoning_effort 档位
+// textOnly = isKnownTextOnlyModel 用的表（Lr）：命中 = 不支持图片（CLI 会把图片换成占位文字）
+// models = 内置模型目录（YO）里未隐藏的条目，作为 /v1/models 的默认列表（CLI 不调 /provider/v1/models）
+const CLI_EFFORT_PRESETS = {
+  E0: ['low', 'medium', 'high', 'xhigh', 'max'],
+  E1: ['low', 'medium', 'high', 'xhigh'],
+  E2: ['low', 'medium', 'high'],
+  E3: ['off', 'high', 'max'],
+  E4: ['low', 'high', 'max'],
+  E5: ['off', 'low', 'high', 'max'],
+  E6: ['high', 'max'],
+  E7: ['low', 'medium', 'high', 'max'],
+  E8: ['low', 'medium', 'xhigh'],
+  E9: ['high', 'xhigh'],
+};
+const CLI_MODEL_EFFORTS = new Map(Object.entries({
+  'claude-sonnet-5-5': CLI_EFFORT_PRESETS.E0,
+  'claude-sonnet-5': CLI_EFFORT_PRESETS.E0,
+  'claude-sonnet-4-6': CLI_EFFORT_PRESETS.E0,
+  'claude-fable-5-1': CLI_EFFORT_PRESETS.E0,
+  'claude-fable-5': CLI_EFFORT_PRESETS.E0,
+  'claude-opus-5-5': CLI_EFFORT_PRESETS.E0,
+  'claude-opus-5': CLI_EFFORT_PRESETS.E0,
+  'claude-opus-4-8': CLI_EFFORT_PRESETS.E0,
+  'claude-opus-4-7': CLI_EFFORT_PRESETS.E0,
+  'gpt-6-astra': CLI_EFFORT_PRESETS.E0,
+  'gpt-6.1-sol': CLI_EFFORT_PRESETS.E0,
+  'gpt-6-sol': CLI_EFFORT_PRESETS.E0,
+  'gpt-6-luna': CLI_EFFORT_PRESETS.E0,
+  'gpt-5.6-sol': CLI_EFFORT_PRESETS.E0,
+  'gpt-5.6-terra': CLI_EFFORT_PRESETS.E0,
+  'gpt-5.6-luna': CLI_EFFORT_PRESETS.E0,
+  'gpt-5.5': CLI_EFFORT_PRESETS.E1,
+  'gpt-5.4': CLI_EFFORT_PRESETS.E1,
+  'gpt-5.3-codex': CLI_EFFORT_PRESETS.E1,
+  'gpt-5.4-mini': CLI_EFFORT_PRESETS.E2,
+  'deepseek/deepseek-v4-pro': CLI_EFFORT_PRESETS.E3,
+  'deepseek/deepseek-v4-flash': CLI_EFFORT_PRESETS.E3,
+  'deepseek/deepseek-v4-flash-vision-exp': CLI_EFFORT_PRESETS.E3,
+  'deepseek/deepseek-v4-flash-fast': CLI_EFFORT_PRESETS.E4,
+  'deepseek/deepseek-v4.1-flash': CLI_EFFORT_PRESETS.E5,
+  'deepseek/deepseek-v4.1-flash-fast': CLI_EFFORT_PRESETS.E5,
+  'moonshotai/Kimi-K3': CLI_EFFORT_PRESETS.E4,
+  'zai-org/GLM-5.3': CLI_EFFORT_PRESETS.E4,
+  'z-ai/glm-5.3-flash': CLI_EFFORT_PRESETS.E4,
+  'z-ai/glm-5.3-flashx': CLI_EFFORT_PRESETS.E4,
+  'zai-org/GLM-5.2': CLI_EFFORT_PRESETS.E6,
+  'google/gemini-3.8-flash': CLI_EFFORT_PRESETS.E2,
+  'google/gemini-3.7-flash': CLI_EFFORT_PRESETS.E2,
+  'stealth/space-bunny-alpha': CLI_EFFORT_PRESETS.E7,
+  'stealth/pixel-canary': CLI_EFFORT_PRESETS.E8,
+  'google/gemini-3.6-flash': CLI_EFFORT_PRESETS.E2,
+  'google/gemini-3.5-flash': CLI_EFFORT_PRESETS.E2,
+  'google/gemini-3.5-flash-lite': CLI_EFFORT_PRESETS.E2,
+  'google/gemini-3.1-flash-lite': CLI_EFFORT_PRESETS.E2,
+  'tencent/hy4-preview': CLI_EFFORT_PRESETS.E2,
+  'inclusionai/ling-3.1-flash:free': CLI_EFFORT_PRESETS.E2,
+  'sakana/fugu-ultra': CLI_EFFORT_PRESETS.E9,
+  'xai/grok-4.5': CLI_EFFORT_PRESETS.E2,
+  'xai/grok-4.6': CLI_EFFORT_PRESETS.E1,
+  'xai/grok-4.7': CLI_EFFORT_PRESETS.E1,
+  'Qwen/Qwen3.8-Omni-Flash': CLI_EFFORT_PRESETS.E8,
+  'Qwen/Qwen3.8-Max-0902': CLI_EFFORT_PRESETS.E8,
+  'Qwen/Qwen3.8-Max': CLI_EFFORT_PRESETS.E8,
+  'Qwen/Qwen3.8-27B': CLI_EFFORT_PRESETS.E8,
+  'Qwen/Qwen3.8-Flash': CLI_EFFORT_PRESETS.E8,
+  'meta/muse-spark-1.1': CLI_EFFORT_PRESETS.E1,
+  'meta/muse-spark-1.2': CLI_EFFORT_PRESETS.E1,
+  'meta/muse-spark-1.2-contributor': CLI_EFFORT_PRESETS.E1,
+  'meta/muse-spark-1.3': CLI_EFFORT_PRESETS.E0,
+  'meta/muse-spark-1.3-contributor': CLI_EFFORT_PRESETS.E1,
+  'stepfun/Step-5-Preview': CLI_EFFORT_PRESETS.E2,
+  'MiniMaxAI/MiniMax-M3': CLI_EFFORT_PRESETS.E2,
+  'minimax/minimax-m3-free': CLI_EFFORT_PRESETS.E2,
+  'MiniMaxAI/MiniMax-M3-Free': CLI_EFFORT_PRESETS.E2,
+}));
+const CLI_TEXT_ONLY_MODELS = new Set([
+  'deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-fast',
+  'zai-org/GLM-5.3', 'zai-org/GLM-5.2', 'zai-org/GLM-5.2-Fast',
+  'zai-org/GLM-5.1', 'zai-org/GLM-5', 'MiniMaxAI/MiniMax-M2.7',
+  'minimax/minimax-m2.7-free', 'MiniMaxAI/MiniMax-M2.5', 'xiaomi/mimo-v2.5-pro',
+  'Qwen/Qwen3.6-Max-Preview', 'Qwen/Qwen3.7-Max', 'meituan/LongCat-2.0',
+  'meituan/LongCat-2.0:free', 'stepfun/Step-3.5-Flash', 'tencent/hy4-preview',
+  'tencent/Hy3', 'tencent/hy3-paid', 'nvidia/nemotron-3-ultra-550b-a55b',
+  'poolside/laguna-s-2.1-free', 'inclusionai/ling-3.0-flash-free', 'inclusionai/ling-3.0-flash-sante:free',
+  'inclusionai/ling-3.1-flash:free',
+]);
+const CLI_MODEL_ALIASES = {
+  'claude-sonnet-4-20250514': 'claude-sonnet-4-6',
+  'claude-sonnet-4-5-20250929': 'claude-sonnet-4-6',
+  'claude-opus-4-5-20251101': 'claude-opus-4-7',
+  'claude-opus-4-6': 'claude-opus-4-7',
+  'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
+};
 const MODELS = [
-  // Anthropic
+  { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
+  { id: 'claude-sonnet-5', name: 'Claude Sonnet 5' },
   { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+  { id: 'claude-fable-5-1', name: 'Claude Fable 5.1' },
+  { id: 'claude-fable-5', name: 'Claude Fable 5' },
+  { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+  { id: 'claude-opus-5', name: 'Claude Opus 5' },
   { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
   { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
   { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
-  // OpenAI
+  { id: 'gpt-6-astra', name: 'GPT-6 Astra' },
+  { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol' },
+  { id: 'gpt-6-sol', name: 'GPT-6 Sol' },
+  { id: 'gpt-6-luna', name: 'GPT-6 Luna' },
+  { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' },
+  { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra' },
+  { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' },
   { id: 'gpt-5.5', name: 'GPT-5.5' },
   { id: 'gpt-5.4', name: 'GPT-5.4' },
-  { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
   { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex' },
-  // DeepSeek
-  { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-  { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-  // Kimi
+  { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
+  { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro (latest)' },
+  { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash (latest)' },
+  { id: 'deepseek/deepseek-v4-flash-vision-exp', name: 'DeepSeek V4 Flash Vision (exp)' },
+  { id: 'deepseek/deepseek-v4-flash-fast', name: 'DeepSeek V4 Flash Fast' },
+  { id: 'deepseek/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
+  { id: 'deepseek/deepseek-v4.1-flash-fast', name: 'DeepSeek V4.1 Flash Fast' },
+  { id: 'moonshotai/Kimi-K3', name: 'Kimi K3' },
+  { id: 'moonshotai/Kimi-K2.7-Code', name: 'Kimi K2.7 Code' },
+  { id: 'moonshotai/Kimi-K2.7-Code-Highspeed', name: 'Kimi K2.7 Code HighSpeed' },
   { id: 'moonshotai/Kimi-K2.6', name: 'Kimi K2.6' },
   { id: 'moonshotai/Kimi-K2.5', name: 'Kimi K2.5' },
-  // GLM
-  { id: 'zai-org/GLM-5.1', name: 'GLM 5.1' },
-  { id: 'zai-org/GLM-5', name: 'GLM 5' },
-  // MiniMax
+  { id: 'z-ai/glm-5.3-flash', name: 'GLM-5.3 Flash' },
+  { id: 'z-ai/glm-5.3-flashx', name: 'GLM-5.3 FlashX' },
+  { id: 'zai-org/GLM-5.3', name: 'GLM-5.3' },
+  { id: 'zai-org/GLM-5.2', name: 'GLM-5.2' },
+  { id: 'zai-org/GLM-5.2-Fast', name: 'GLM-5.2 Fast' },
+  { id: 'zai-org/GLM-5.1', name: 'GLM-5.1' },
+  { id: 'zai-org/GLM-5', name: 'GLM-5' },
   { id: 'MiniMaxAI/MiniMax-M3', name: 'MiniMax M3' },
   { id: 'MiniMaxAI/MiniMax-M2.7', name: 'MiniMax M2.7' },
   { id: 'MiniMaxAI/MiniMax-M2.5', name: 'MiniMax M2.5' },
-  // Qwen
-  { id: 'Qwen/Qwen3.6-Max-Preview', name: 'Qwen 3.6 Max Preview' },
-  { id: 'Qwen/Qwen3.6-Plus', name: 'Qwen 3.6 Plus' },
-  { id: 'Qwen/Qwen3.7-Max', name: 'Qwen 3.7 Max' },
-  // Step
-  { id: 'stepfun/Step-3.7-Flash', name: 'Step 3.7 Flash' },
-  { id: 'stepfun/Step-3.5-Flash', name: 'Step 3.5 Flash' },
-  // Xiaomi
+  { id: 'xiaomi/mimo-v2.6-pro', name: 'MiMo V2.6 Pro' },
+  { id: 'xiaomi/mimo-v2.6-pro-ultraspeed', name: 'MiMo V2.6 Pro UltraSpeed' },
+  { id: 'xiaomi/mimo-v2.6-flash', name: 'MiMo V2.6 Flash' },
   { id: 'xiaomi/mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
   { id: 'xiaomi/mimo-v2.5', name: 'MiMo V2.5' },
-  // Gemini
+  { id: 'Qwen/Qwen3.8-Omni-Flash', name: 'Qwen 3.8 Omni Flash' },
+  { id: 'Qwen/Qwen3.8-Max-0902', name: 'Qwen 3.8 Max 0902' },
+  { id: 'Qwen/Qwen3.8-Max', name: 'Qwen 3.8 Max' },
+  { id: 'Qwen/Qwen3.8-27B', name: 'Qwen 3.8 27B' },
+  { id: 'Qwen/Qwen3.8-Flash', name: 'Qwen 3.8 Flash' },
+  { id: 'Qwen/Qwen3.7-Max', name: 'Qwen 3.7 Max' },
+  { id: 'Qwen/Qwen3.7-Plus', name: 'Qwen 3.7 Plus' },
+  { id: 'Qwen/Qwen3.7-Flash', name: 'Qwen 3.7 Flash' },
+  { id: 'Qwen/Qwen3.6-Max-Preview', name: 'Qwen 3.6 Max Preview' },
+  { id: 'Qwen/Qwen3.6-Plus', name: 'Qwen 3.6 Plus' },
+  { id: 'meituan/LongCat-2.0', name: 'LongCat 2.0' },
+  { id: 'stepfun/Step-5-Preview', name: 'Step 5 Preview' },
+  { id: 'stepfun/Step-3.7-Flash', name: 'Step 3.7 Flash' },
+  { id: 'stepfun/Step-3.5-Flash', name: 'Step 3.5 Flash' },
+  { id: 'tencent/hy3-paid', name: 'Tencent Hy3' },
+  { id: 'tencent/hy4-preview', name: 'Tencent Hy4 Preview' },
+  { id: 'google/gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+  { id: 'google/gemini-3.7-flash', name: 'Gemini 3.7 Flash' },
+  { id: 'google/gemini-3.6-flash', name: 'Gemini 3.6 Flash' },
   { id: 'google/gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
+  { id: 'google/gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite' },
   { id: 'google/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
+  { id: 'sakana/fugu-ultra', name: 'Fugu Ultra' },
+  { id: 'nvidia/nemotron-3-ultra-550b-a55b', name: 'Nemotron 3 Ultra' },
+  { id: 'thinkingmachines/inkling', name: 'Inkling' },
+  { id: 'thinkingmachines/inkling-small', name: 'Inkling Small' },
+  { id: 'stealth/space-bunny-alpha', name: 'Space Bunny Alpha' },
+  { id: 'poolside/laguna-s-2.1-free', name: 'Laguna S 2.1' },
+  { id: 'inclusionai/ling-3.0-flash-sante:free', name: 'Ling 3.0 Flash Sante' },
+  { id: 'inclusionai/ling-3.1-flash:free', name: 'Ling 3.1 Flash' },
+  { id: 'meta/muse-spark-1.1', name: 'Muse Spark 1.1' },
+  { id: 'meta/muse-spark-1.2', name: 'Muse Spark 1.2' },
+  { id: 'meta/muse-spark-1.2-contributor', name: 'Muse Spark 1.2 Contributor' },
+  { id: 'meta/muse-spark-1.3', name: 'Muse Spark 1.3' },
+  { id: 'meta/muse-spark-1.3-contributor', name: 'Muse Spark 1.3 Contributor' },
+  { id: 'xai/grok-4.5', name: 'Grok 4.5' },
+  { id: 'xai/grok-4.6', name: 'Grok 4.6' },
+  { id: 'xai/grok-4.7', name: 'Grok 4.7' },
 ];
+
+// CLI 的 canonicalizeModelId：别名表 → 大小写不敏感匹配已知 id → 去掉 -YYYYMMDD / @YYYYMMDD 后缀再试一次
+const CLI_KNOWN_MODEL_IDS = new Map([...CLI_MODEL_EFFORTS.keys(), ...CLI_TEXT_ONLY_MODELS, ...MODELS.map(m => m.id)]
+  .map(id => [id.toLowerCase(), id]));
+function cliResolveKnown(model) {
+  const lower = String(model).toLowerCase();
+  return CLI_KNOWN_MODEL_IDS.get((CLI_MODEL_ALIASES[lower] ?? lower).toLowerCase());
+}
+function canonicalizeModelId(model) {
+  if (!model) return model;
+  const direct = cliResolveKnown(model);
+  if (direct) return direct;
+  const stripped = String(model).replace(/[-@]\d{8}$/, '');
+  return stripped === model ? model : (cliResolveKnown(stripped) ?? model);
+}
+// registry.supportsThinking / getSupportedEfforts：不在表里 = 不支持思考，CLI 不发 reasoning_effort
+function cliSupportedEfforts(model) {
+  return CLI_MODEL_EFFORTS.get(canonicalizeModelId(model)) ?? null;
+}
+// registry.supportsVision：只有已知纯文本模型返回 false；未知模型按支持图片处理（与 CLI 一致）
+function cliSupportsVision(model) {
+  return !CLI_TEXT_ONLY_MODELS.has(canonicalizeModelId(model));
+}
+
+// 客户端给的档位不一定是该模型接受的值（OpenAI 的 minimal/none、Anthropic 预算换算出来的 medium……）。
+// CLI 只会发模型表里的值，所以这里按强度序吸附到最近的受支持档位（同距取更高档）；不支持思考的模型直接不发。
+const EFFORT_SCALE = ['off', 'low', 'medium', 'high', 'xhigh', 'max'];
+const EFFORT_INPUT_ALIASES = { none: 'off', minimal: 'low', disabled: 'off' };
+function resolveCliEffort(model, requested) {
+  if (requested === undefined || requested === null || requested === '') return undefined;
+  const supported = cliSupportedEfforts(model);
+  if (!supported) return undefined;
+  const want = EFFORT_INPUT_ALIASES[String(requested).toLowerCase()] ?? String(requested).toLowerCase();
+  if (supported.includes(want)) return want;
+  const rank = EFFORT_SCALE.indexOf(want);
+  if (rank === -1) return undefined;
+  // 想关思考但模型没有 off 档：不发（CLI 用户没设 effort 时也是不发）
+  if (want === 'off') return undefined;
+  let best;
+  let bestDist = Infinity;
+  for (const level of supported) {
+    if (level === 'off') continue;
+    const dist = Math.abs(EFFORT_SCALE.indexOf(level) - rank);
+    if (dist < bestDist || (dist === bestDist && EFFORT_SCALE.indexOf(level) > EFFORT_SCALE.indexOf(best))) {
+      best = level;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
 
 // ── 工具函数 ───────────────────────────────────────
 
@@ -522,14 +805,71 @@ function getDateStr() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
+// buildCcRequest 在请求体上挂的旁路信息（Symbol 键：JSON.stringify 不会序列化，对象展开会保留）
+const WIRE_TOOL_ALIASES = Symbol('wireToolAliases'); // wire 名 → 客户端原名（响应里要改回去）
+const WIRE_TOOL_SCHEMAS = Symbol('wireToolSchemas'); // wire 名 → input_schema（修整 tool-call 输入用）
+
+// CLI 1.73.4 的 toWireToolName：只有一条重写（jw="tool_search" → Uw="search_tools"）。
+// 1.53.1 时代的 bash_output/task_output → shell_output、read_multiple_files → read_file 已不复存在；
+// 而且那两条会把两个不同的客户端工具折成同一个名字。
+const TOOL_NAME_ALIASES = { tool_search: 'search_tools' };
+
+// CLI 的 stripImages 用的占位文字（Qk / Yk 原文）
+const visionMarker = (n) => `<attached_image index="${n}">\nAn image is attached here. You cannot view it directly. If a vision tool is available, call it with image_index=${n} to read the image; otherwise tell the user you cannot see images.\n</attached_image>`;
+const IMAGE_OMITTED_TEXT = '[image omitted: the active model is text-only]';
+
+// CLI 只认三种 user 部件：text / image（tool-result 在单独的 tool 消息里）。其余字段（cache_control 等）CLI 从不发。
+function toWireUserParts(content) {
+  if (typeof content === 'string') return [{ type: 'text', text: content }];
+  if (!Array.isArray(content)) return [{ type: 'text', text: String(content ?? '') }];
+  const parts = [];
+  for (const part of content) {
+    if (!part) continue;
+    if (typeof part === 'string') { parts.push({ type: 'text', text: part }); continue; }
+    if (part.type === 'text' || part.type === 'input_text') {
+      parts.push({ type: 'text', text: String(part.text ?? '') });
+    } else if (part.type === 'image_url' || part.type === 'input_image') {
+      // CC CLI 真实格式: { type: "image", image: "data:<mime>;base64,...", mimeType: "<mime>" }
+      const url = (typeof part.image_url === 'string' ? part.image_url : part.image_url?.url) || '';
+      if (!url) continue;
+      const mediaType = /^data:([^;,]+)/.exec(url)?.[1];
+      parts.push({ type: 'image', image: url, ...(mediaType ? { mimeType: mediaType } : {}) });
+    } else if (part.type === 'image' && typeof part.image === 'string') {
+      parts.push({ type: 'image', image: part.image, ...(part.mimeType ? { mimeType: part.mimeType } : {}) });
+    }
+  }
+  return parts;
+}
+
+// CLI 的 stripImages：不支持图片的模型 —— 最后一条带图的 user 消息里，每张图换成带序号的 visionMarker；
+// 更早的 user 消息直接去掉图片，若因此变空则换成 IMAGE_OMITTED_TEXT。
+function stripImagesForTextOnlyModel(messages) {
+  let last = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user' && messages[i].content.some(p => p.type === 'image')) { last = i; break; }
+  }
+  if (last === -1) return messages;
+  return messages.map((m, i) => {
+    if (m.role !== 'user') return m;
+    if (i === last) {
+      let n = 0;
+      return { role: 'user', content: m.content.map(p => (p.type === 'image' ? { type: 'text', text: visionMarker(++n) } : p)) };
+    }
+    const kept = m.content.filter(p => p.type !== 'image');
+    if (kept.length === m.content.length) return m;
+    return { role: 'user', content: kept.length ? kept : [{ type: 'text', text: IMAGE_OMITTED_TEXT }] };
+  });
+}
+
+function clientToolName(t) { return t?.function?.name || t?.name || ''; }
+
 function buildCcRequest(openaiReq) {
-  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
+  const { model, messages, max_tokens, tools, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
+  const wireModel = model || 'deepseek/deepseek-v4-flash';
 
   // 提取系统提示：OpenAI 的 system / developer 都映射为系统提示。
-  // 形态对齐 CLI 的 toWireSystem —— **块数组**，非最后一块补 \n，cache_control 逐块保留。
-  // （CLI 的 composeSystemPrompt：基础提示词是字符串时发字符串、是 sections 时发块数组；
-  //   真机验证两种形态服务端都接受，见 PROTOCOL-FACTS-1.53.1.md。这里统一用块数组，
-  //   才能把客户端标在 system 上的缓存断点原样送上去。）
+  // 形态对齐 CLI 的 toWireSystem —— **块数组**，非最后一块补 \n，cache_control 逐块保留
+  // （CLI 的 systemSections[].cache → cache_control: ephemeral，这是 CLI 唯一会发缓存断点的位置）。
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
   const systemBlocks = [];
   for (const m of systemMsgs) {
@@ -540,106 +880,128 @@ function buildCcRequest(openaiReq) {
         const text = c?.text ?? c?.content ?? '';
         if (text === '' && !c?.cache_control) continue;
         const block = { type: 'text', text: String(text) };
-        if (c?.cache_control) block.cache_control = c.cache_control;
+        if (c?.cache_control) block.cache_control = { type: 'ephemeral' };
         systemBlocks.push(block);
       }
     } else if (m.content != null) {
       systemBlocks.push({ type: 'text', text: String(m.content) });
     }
   }
-  for (let i = 0; i < systemBlocks.length - 1; i++) systemBlocks[i].text += '\n';
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
-  // Build tool_call_id → tool_name reverse lookup
+  // ── 工具：定义全量透传（name / description / input_schema，与 CLI 的 toWireTools 同形）──
+  // tool_choice / parallel_tool_calls 是 CLI 从不上送的字段，改用 CLI 本身就会发的结构来模拟：
+  //   none             → tools: []（CLI 没有工具时发的就是空数组）
+  //   指定某个函数      → 只下发那一个工具 + 一条系统指令要求调用它
+  //   required / any   → 系统指令要求必须调用工具
+  //   parallel=false   → 系统指令要求一次最多调一个工具
+  // temperature 没有 CLI 能表达的等价物（CLI 的 agent 回合从不发），只能丢弃。
+  let toolDefs = Array.isArray(tools) ? tools : [];
+  const directives = [];
+  const tc = tool_choice;
+  const tcType = typeof tc === 'string' ? tc : tc?.type;
+  if (tcType === 'none') {
+    toolDefs = [];
+  } else if (tcType === 'required' || tcType === 'any') {
+    if (toolDefs.length) directives.push('You must call at least one of the available tools in your next response.');
+  } else if (tcType === 'function' || tcType === 'tool') {
+    const name = tc.function?.name ?? tc.name;
+    const only = toolDefs.filter(t => clientToolName(t) === name);
+    if (name && only.length) {
+      toolDefs = only;
+      directives.push(`You must call the \`${name}\` tool in your next response.`);
+    }
+  }
+  if (parallel_tool_calls === false && toolDefs.length) directives.push('Call at most one tool per response.');
+
+  // 工具名重写：客户端同时定义了两个名字时不重写（否则会出现重名工具）
+  const clientNames = new Set(toolDefs.map(clientToolName));
+  const aliases = {};
+  for (const [from, to] of Object.entries(TOOL_NAME_ALIASES)) {
+    if (clientNames.has(from) && !clientNames.has(to)) aliases[from] = to;
+  }
+  const wireName = (n) => aliases[n] || n;
+  const schemas = new Map();
+  const wireTools = toolDefs.map(t => {
+    const name = wireName(clientToolName(t));
+    const input_schema = t.function?.parameters || t.input_schema || t.parameters || { type: 'object', properties: {} };
+    schemas.set(name, input_schema);
+    return { name, description: t.function?.description || t.description || '', input_schema };
+  });
+
+  // Build tool_call_id → tool_name reverse lookup（CLI：tool-result 的 toolName 取自对应 tool-call 的 wire 名）
   const toolNameMap = {};
   for (const msg of chatMessages) {
     if (msg.role === 'assistant' && msg.tool_calls) {
-      for (const tc of msg.tool_calls) {
-        if (tc.id) {
-          toolNameMap[tc.id] = tc.function?.name || '';
-        }
-      }
+      for (const tc2 of msg.tool_calls) if (tc2.id) toolNameMap[tc2.id] = wireName(tc2.function?.name || '');
     }
   }
 
-  // 转换 messages 为 CC 格式
-  const ccMessages = chatMessages.map(msg => {
-    if (msg.role === 'user') {
-      if (typeof msg.content === 'string') {
-        return { role: 'user', content: [{ type: 'text', text: msg.content }] };
-      }
-      // 多模态：数组 content 原样透传（text + image_url → CC image 格式）
-      if (Array.isArray(msg.content)) {
-        const parts = msg.content.map(part => {
-          if (part.type === 'image_url') {
-            const url = part.image_url?.url || '';
-            // CC CLI 真实格式: { type: "image", image: "data:<mime>;base64,...", mimeType: "<mime>" }
-            const mediaType = /^data:([^;,]+)/.exec(url)?.[1];
-            const imagePart = { type: 'image', image: url };
-            if (mediaType) imagePart.mimeType = mediaType;
-            return imagePart;
-          }
-          return part;
-        }).filter(Boolean);
-        return { role: 'user', content: parts };
-      }
-      return { role: 'user', content: [{ type: 'text', text: String(msg.content) }] };
-    }
+  // ── 消息：逐条对齐 CLI 的 toWireMessages ──
+  let ccMessages = [];
+  for (const msg of chatMessages) {
     if (msg.role === 'assistant') {
       const parts = [];
-      // 思考内容必须回传：CC 在 thinking 模式下校验 reasoning 是否随历史带回，
-      // 丢弃会让上游直接拒绝。次序也必须与 CC CLI 的抓包格式一致 ——
-      // [reasoning, text, tool-call]，reasoning 在最前。
-      if (msg.reasoning_content) {
-        parts.push({ type: 'reasoning', text: msg.reasoning_content });
-      }
-      if (msg.content && typeof msg.content === 'string') {
+      // 思考内容必须回传（CC 在 thinking 模式下校验 reasoning 是否随历史带回）；次序 [reasoning, text, tool-call]
+      if (msg.reasoning_content) parts.push({ type: 'reasoning', text: String(msg.reasoning_content) });
+      if (typeof msg.content === 'string') {
         if (msg.content) parts.push({ type: 'text', text: msg.content });
-      } else if (msg.content && Array.isArray(msg.content)) {
+      } else if (Array.isArray(msg.content)) {
         for (const part of msg.content) {
           if (!part) continue;
-          if (part.type === 'text') parts.push(part);
-          // 客户端直接把 reasoning 放在 content 数组里时同样透传；
-          // 已有 reasoning_content 字段则不重复
-          else if (part.type === 'reasoning' && !msg.reasoning_content) parts.push(part);
+          if (part.type === 'text' || part.type === 'output_text') parts.push({ type: 'text', text: String(part.text ?? '') });
+          else if (part.type === 'reasoning' && !msg.reasoning_content) parts.push({ type: 'reasoning', text: String(part.text ?? '') });
         }
       }
-      if (msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          parts.push({
-            type: 'tool-call',
-            toolCallId: tc.id,
-            toolName: tc.function?.name || '',
-            input: (typeof tc.function?.arguments === 'string' ? tryParseJSON(tc.function.arguments) : (tc.function?.arguments || {})),
-          });
-        }
+      for (const call of msg.tool_calls || []) {
+        const args = call.function?.arguments;
+        const parsed = typeof args === 'string' ? tryParseJSON(args) : (args || {});
+        parts.push({
+          type: 'tool-call',
+          toolCallId: call.id,
+          toolName: wireName(call.function?.name || ''),
+          input: parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {},
+        });
       }
-      return { role: 'assistant', content: parts };
-    }
-    if (msg.role === 'tool') {
-      return {
-        role: 'tool',
-        content: [{
-          type: 'tool-result',
-          toolCallId: msg.tool_call_id,
-          toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
-          output: { type: 'text', value: toWireToolOutputValue(msg.content) },
-        }],
+      ccMessages.push({ role: 'assistant', content: parts });
+    } else if (msg.role === 'tool') {
+      const result = {
+        type: 'tool-result',
+        toolCallId: msg.tool_call_id,
+        toolName: toolNameMap[msg.tool_call_id] || wireName(msg.name || '') || 'unknown',
+        output: { type: 'text', value: toWireToolOutputValue(msg.content) },
       };
+      // CLI 把同一回合的全部工具结果放进**一条** tool 消息
+      const prev = ccMessages[ccMessages.length - 1];
+      if (prev?.role === 'tool') prev.content.push(result);
+      else ccMessages.push({ role: 'tool', content: [result] });
+    } else {
+      // user（以及未知 role 兜底）
+      const parts = toWireUserParts(msg.content);
+      if (parts.length) ccMessages.push({ role: 'user', content: parts });
     }
-    // 未知 role 兜底：归一化为 user 并保证 content 为数组，避免 CC 校验拒绝
-    return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] };
-  });
+  }
+  if (!cliSupportsVision(wireModel)) ccMessages = stripImagesForTextOnlyModel(ccMessages);
 
-  // 缓存断点：system 是块数组，断点可以原样留在 system 上（CLI 的 systemSections[].cache 同义）。
-  // 客户端已在任意消息块 / system 块上打过断点就保留；否则若给了 OpenAI 系的 prompt_cache_key，
-  // 把断点落在 system 最后一块 —— 缓存按前缀计算，system 正是最前的那段前缀。
-  const hasCacheMarker = systemBlocks.some(b => b.cache_control) || ccMessages.some(msg =>
-    Array.isArray(msg.content) && msg.content.some(part => part?.cache_control));
-  if (prompt_cache_key && !hasCacheMarker && systemBlocks.length) {
+  // 缓存断点：若给了 OpenAI 系的 prompt_cache_key 而客户端没在 system 上标断点，落在 system 最后一块
+  // （缓存按前缀计算，system 正是最前的那段前缀）。模拟出来的指令块排在断点之后，不影响前缀命中。
+  if (prompt_cache_key && systemBlocks.length && !systemBlocks.some(b => b.cache_control)) {
     systemBlocks[systemBlocks.length - 1].cache_control = { type: 'ephemeral' };
   }
+  if (directives.length) systemBlocks.push({ type: 'text', text: directives.join('\n') });
+  for (let i = 0; i < systemBlocks.length - 1; i++) systemBlocks[i].text += '\n';
 
+  let system;
+  if (systemBlocks.length) {
+    system = systemBlocks;
+  } else if (CFG.emptySystemPlaceholder) {
+    // CC 上游在 params.system 缺省时会注入自身约 7.5K token 的默认提示词（issue #17）；发一个空格占位即可绕过。
+    system = [{ type: 'text', text: ' ' }];
+  }
+
+  // 信封键序对齐 CLI：config, memory, taste, skills, permissionMode, threadId, mode, promptCache, params
+  // （threadId 在 forwardToCC 里补）。CLI 1.73.4 的 agent 回合**不带 mode**（主循环配置里没有这个字段，
+  // JSON 序列化时整键消失）；只有 title-gen / compact 等功能调用才带。cliMode 可显式指定。
   const body = {
     config: {
       // 伪造的项目目录（不再发宿主真实 cwd）；environment 用伪装的平台词，与指纹保持自洽
@@ -657,67 +1019,27 @@ function buildCcRequest(openaiReq) {
     taste: null,
     skills: null,          // CLI 发 null，不是空串
     permissionMode: 'standard',
-    mode: CFG.cliMode || 'agent',
-    // threadId 需为合法 UUID，否则整键省略（CLI 的 toWireThreadId）—— 在 forwardToCC 拿到 sessionId 后补
-    params: {
-      model: model || 'deepseek/deepseek-v4-flash',
-      messages: ccMessages,
-      max_tokens: Math.min(max_tokens || 64000, 200000),
-      stream: true,  // CC API 总是 stream
-    },
+  };
+  if (CFG.cliMode) body.mode = CFG.cliMode;
+
+  // params 键序对齐 CLI：model, messages, tools, system, max_tokens, stream, [temperature], [reasoning_effort]
+  const effort = resolveCliEffort(wireModel, reasoning_effort);
+  body.params = {
+    model: wireModel,
+    messages: ccMessages,
+    tools: wireTools,       // CLI 总是下发 tools（没有工具时是空数组）
+    ...(system ? { system } : {}),
+    max_tokens: Math.min(max_tokens || 64000, 200000),
+    stream: true,           // CC API 总是 stream
+    ...(effort ? { reasoning_effort: effort } : {}),
   };
 
-  // 条件字段
-  if (systemBlocks.length) {
-    body.params.system = systemBlocks;
-  } else if (CFG.emptySystemPlaceholder) {
-    // CC 上游在 params.system 缺省时会注入自身约 7.5K token 的默认提示词（进入
-    // 默认上下文/前缀路径），既产生大量 cached tokens 又污染对话（模型会以为
-    // 自己在 CC 的可执行目录里，见 issue #17）。发一个空格占位即可绕过，
-    // 真机验证 prompt_tokens 从 7653 降到 85。
-    // 默认开启；config.json 设 "emptySystemPlaceholder": false 或环境变量
-    // CC_EMPTY_SYSTEM_PLACEHOLDER=false 可关闭（回到原生的缺省行为）。
-    body.params.system = [{ type: 'text', text: ' ' }];
-  }
-  if (temperature !== undefined) {
-    body.params.temperature = temperature;
-  }
-  if (reasoning_effort !== undefined) {
-    body.params.reasoning_effort = reasoning_effort;
-  }
-  // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
-  // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段
-  body.params.tools = (tools || []).map(t => ({
-      name: toWireToolName(t.function?.name || t.name || ''),
-      description: t.function?.description || t.description || '',
-      input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
-    }));
-  if (tool_choice !== undefined) {
-    // OpenAI 格式 → CC (Anthropic 风格) 格式
-    if (typeof tool_choice === 'string') {
-      const map = { 'auto': 'auto', 'none': 'none', 'required': 'any' };
-      body.params.tool_choice = { type: map[tool_choice] || 'auto' };
-    } else if (tool_choice.type === 'function') {
-      // OpenAI object → Anthropic object
-      body.params.tool_choice = { type: 'tool', name: tool_choice.function?.name };
-    } else {
-      body.params.tool_choice = tool_choice;
-    }
-  }
-  if (parallel_tool_calls !== undefined) {
-    body.params.parallel_tool_calls = parallel_tool_calls;
-  }
-
+  body[WIRE_TOOL_SCHEMAS] = schemas;
+  const reverse = Object.fromEntries(Object.entries(aliases).map(([from, to]) => [to, from]));
+  if (Object.keys(reverse).length) body[WIRE_TOOL_ALIASES] = reverse;
   return body;
 }
 
-// CLI 发送前会重写部分工具名（resolveToolNameAlias / ow 表）
-const TOOL_NAME_ALIASES = {
-  bash_output: 'shell_output',
-  task_output: 'shell_output',
-  tool_search: 'search_tools',
-  read_multiple_files: 'read_file',
-};
 function toWireToolName(name) { return TOOL_NAME_ALIASES[name] || name; }
 
 // CLI 的 toWireToolOutput：只取文本块，用 '\n' 拼接
@@ -1015,19 +1337,53 @@ function mapCcError(ccStatus, ccBody) {
   return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
+// CLI 的 parseEmbeddedErrorJSON：message 形如 `429 {"error":{"type":"…","message":"…"}}`
+function parseEmbeddedErrorJSON(text) {
+  const i = String(text).indexOf('{');
+  if (i === -1) return null;
+  try {
+    const parsed = JSON.parse(text.slice(i));
+    if (typeof parsed?.error?.message !== 'string') return null;
+    const prefix = text.slice(0, i).trim();
+    return {
+      status: /^\d+$/.test(prefix) ? Number(prefix) : null,
+      type: typeof parsed.error.type === 'string' ? parsed.error.type : null,
+      message: parsed.error.message,
+    };
+  } catch {
+    return null;
+  }
+}
+// CLI 的 hasTerminalMarker：这几种错误重试也没用（额度 / 套餐），isStreamErrorRetryable 判为不可重试
+const CLI_TERMINAL_CREDIT_MARKERS = ['premium_credits_exhausted', 'insufficient credits'];
+const CLI_TERMINAL_PLAN_MARKERS = ['model_not_in_plan'];
+
 function mapCcEventError(event) {
-  const message = event.error?.message || event.message || 'Unknown CC error';
-  const code = event.error?.code || event.code || null;
+  // CLI 的 readStreamErrorEvent：error 可能是裸字符串，也可能是 { message, statusCode, isRetryable }
+  const rawMessage = (typeof event.error === 'string' && event.error)
+    || event.error?.message || event.message || 'Unknown CC error';
+  const embedded = parseEmbeddedErrorJSON(rawMessage);
+  const message = embedded ? `${embedded.type ?? 'error'}: ${embedded.message}` : rawMessage;
+  let code = event.error?.code || event.code || null;
+  const lower = message.toLowerCase();
+  const creditMarker = CLI_TERMINAL_CREDIT_MARKERS.some(m => lower.includes(m));
+  const planMarker = CLI_TERMINAL_PLAN_MARKERS.some(m => lower.includes(m));
+  if (!code && creditMarker) code = 'INSUFFICIENT_CREDITS';
+  if (!code && planMarker) code = 'MODEL_NOT_IN_PLAN';
   // 上游 error 事件除了 message 还可能自带 statusCode / isRetryable ——
   // CLI 的 readStreamErrorEvent 读的正是这两个字段，取值链是
   //   parseEmbeddedErrorJSON(message)?.status ?? error.statusCode ?? null
   // 原实现只看 message 里的 "<NNN>" 前缀，statusCode 一律被丢掉，
   // 于是 429 / 503 这类「该退避重试」的信号在代理这一层被抹平成 502「服务端错误」：
   // 客户端不再按限流退避，监控也会把它错误归类成后端故障。
-  const statusMatch = message.match(/^<(\d{3})>/);
-  const reportedStatus = statusMatch
-    ? Number(statusMatch[1])
-    : (Number.isInteger(event.error?.statusCode) ? event.error.statusCode : null);
+  // 取值链对齐 CLI：parseEmbeddedErrorJSON(message)?.status ?? error.statusCode ?? null；另兼容旧的 "<NNN>" 前缀
+  const statusMatch = rawMessage.match(/^<(\d{3})>/);
+  let reportedStatus = embedded?.status
+    ?? (statusMatch ? Number(statusMatch[1]) : null)
+    ?? (Number.isInteger(event.error?.statusCode) ? event.error.statusCode : null);
+  // 终态标记没带状态码时给一个不可重试的语义：额度 → 402（下游看到 429 + code，池账号按额度冷却）；套餐不含该模型 → 400
+  if (reportedStatus === null && creditMarker) reportedStatus = 402;
+  if (reportedStatus === null && planMarker) reportedStatus = 400;
   const ccStatus = reportedStatus ?? 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
@@ -1166,34 +1522,7 @@ function getApiKey(headers) {
 const UPSTREAM_PROXY = CFG.upstreamProxy || '';
 const PROXY_CONNECT_TIMEOUT_MS = 15000;
 
-// 代理 URL 可能带 user:pass —— 任何日志/错误消息都只允许出现 host:port。
-// （README 承诺「隐私保护日志」，把口令打进启动横幅是直接违反。）
-function redactProxyUrl(raw) {
-  if (!raw) return '(direct)';
-  try {
-    const u = new URL(raw);
-    return `${u.protocol}//${u.hostname}${u.port ? ':' + u.port : ''}`;
-  } catch {
-    return '(invalid upstreamProxy)';
-  }
-}
-
-function parseProxyUrl(raw) {
-  let u;
-  try {
-    u = new URL(raw);
-  } catch {
-    // 不回显原串：里面可能就是口令
-    throw new Error('upstreamProxy is not a valid URL (expected http://host:port)');
-  }
-  if (u.protocol !== 'http:') {
-    throw new Error(`upstreamProxy only supports http:// (CONNECT) proxies, got ${u.protocol}//`);
-  }
-  const auth = u.username
-    ? 'Basic ' + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')
-    : null;
-  return { host: u.hostname, port: Number.parseInt(u.port || '80', 10), auth };
-}
+// 代理 URL 的解析 / 脱敏在 pool.mjs（账号池的每账号代理与这里共用同一套实现，也支持 https:// 代理）。
 
 // 启动即校验：写错的代理地址应当立刻拒绝启动，而不是每个请求各 502 一次。
 if (UPSTREAM_PROXY) {
@@ -1210,103 +1539,366 @@ if (UPSTREAM_PROXY) {
   });
 }
 
-/** Response 的 headers 需要字符串值；node 的 set-cookie 是数组，展开为多行。 */
-function headersToInit(raw) {
-  const out = [];
-  for (const [k, v] of Object.entries(raw)) {
-    if (Array.isArray(v)) { for (const item of v) out.push([k, String(item)]); }
-    else if (v !== undefined) out.push([k, String(v)]);
-  }
-  return out;
+/** 配了代理走隧道（实现见 pool.mjs 的 createUpstreamFetch），否则用原生 fetch（默认路径行为完全不变）。 */
+const proxyFetch = UPSTREAM_PROXY ? createUpstreamFetch({ proxy: UPSTREAM_PROXY, connectTimeoutMs: PROXY_CONNECT_TIMEOUT_MS }) : null;
+function upstreamFetch(urlStr, options) {
+  return proxyFetch ? proxyFetch(urlStr, options) : fetch(urlStr, options);
 }
 
-/** 经 HTTP 代理发上游请求，返回与 fetch 兼容的 Response（.ok/.status/.text()/.body）。 */
-async function proxyFetch(urlStr, options = {}) {
-  const proxy = parseProxyUrl(UPSTREAM_PROXY);
-  const u = new URL(urlStr);
-  const isTls = u.protocol === 'https:';
-  const port = Number.parseInt(u.port || (isTls ? '443' : '80'), 10);
-  const target = `${u.hostname}:${port}`;
-  const { signal, body } = options;
-  const onAbort = (fn) => { if (signal) signal.addEventListener('abort', fn, { once: true }); };
+// ── 账号上下文 ──────────────────────────────────────
+// 每个请求解析出一个「账号上下文」，上游调用（generate / 指纹 / lifecycle / models）全部经它走：
+//   - 透传：客户端自带 user_ key —— 与以前完全一样（全局 upstreamFetch、全局 session / 指纹表）；
+//   - 账号池：从池里租一个账号 —— 该账号自己的 key、出口、设备档案、会话、模型缓存、超时计数。
 
-  // 1. CONNECT 隧道 —— 代理只做裸字节转发，TLS 由本端端到端完成
-  const rawSocket = await new Promise((resolve, reject) => {
-    const connectReq = http.request({
-      host: proxy.host,
-      port: proxy.port,
-      method: 'CONNECT',
-      path: target,
-      headers: { Host: target, ...(proxy.auth ? { 'Proxy-Authorization': proxy.auth } : {}) },
-      timeout: PROXY_CONNECT_TIMEOUT_MS,
-    });
-    connectReq.on('connect', (res, socket) => {
-      if (res.statusCode !== 200) {
-        socket.destroy();
-        reject(new Error(`upstream proxy CONNECT ${target} failed: HTTP ${res.statusCode}`));
+const globalModelsCache = { models: null, at: 0 };
+
+function passthroughContext(apiKey) {
+  return {
+    pooled: false,
+    key: apiKey,
+    fetch: upstreamFetch,
+    deviceProfile: DEVICE_PROFILE,
+    get initState() { return getOrCreateKeyState(apiKey); },
+    sessions: sessionStore,
+    modelsCache: globalModelsCache,
+    timeouts: globalTimeouts,
+    logTag: undefined,
+    lease: null,
+  };
+}
+
+function accountContext(account, lease = null) {
+  const st = account.state;
+  return {
+    pooled: true,
+    key: account.key,
+    fetch: account.fetch,
+    deviceProfile: st.deviceProfile,
+    initState: st.init,
+    sessions: st.sessions,
+    modelsCache: st.models,
+    timeouts: st.timeouts,
+    logTag: { account: account.name },
+    lease,
+  };
+}
+
+/** 池账号的协议层状态（pool.mjs 的 createState 回调）。 */
+function createAccountProtocolState(account) {
+  const salt = account.config.fingerprintSalt ?? CFG.fingerprintSalt;
+  const state = {
+    deviceProfile: deriveDeviceProfile(account.key, salt, account.config.deviceProjectDir),
+    init: { fingerprint: generateFingerprint(account.key, salt), nextInitAt: 0, initializing: null },
+    sessions: new Map(),
+    models: { models: null, at: 0 },
+    timeouts: { count: 0 },
+  };
+  log('info', 'Fingerprint generated for pooled account', { account: account.name });
+  return state;
+}
+
+/** 池模式下的会话粘性键：客户端会话 id > prompt_cache_key > user > 首轮内容哈希。 */
+function conversationKeyOf(headers, openaiReq) {
+  if (!POOL) return null;
+  const sid = clientSessionIdOf(headers, null);
+  if (sid) return `s:${sid}`;
+  if (typeof openaiReq?.prompt_cache_key === 'string' && openaiReq.prompt_cache_key) return `p:${openaiReq.prompt_cache_key}`;
+  if (typeof openaiReq?.user === 'string' && openaiReq.user) return `u:${openaiReq.user}`;
+  const msgs = Array.isArray(openaiReq?.messages) ? openaiReq.messages : [];
+  const sys = msgs.find(m => m?.role === 'system' || m?.role === 'developer');
+  const firstUser = msgs.find(m => m?.role === 'user');
+  if (!firstUser) return null;
+  try {
+    return 'h:' + crypto.createHash('sha256')
+      .update(JSON.stringify([openaiReq.model || '', sys?.content ?? null, firstUser.content ?? null]))
+      .digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 为请求解析账号：
+ *   { kind: 'ok', ctx }              可以开始了
+ *   { kind: 'missing' }              既没有客户端 key、也没开账号池 → 由调用方回原来的 401
+ *   { kind: 'error', status, ... }   账号池准入失败（排队满 / 超时 / 全员冷却）
+ *   { kind: 'gone' }                 排队期间客户端断开了
+ * 租约在响应 finish/close 时释放（覆盖流的整个生命周期），幂等。
+ */
+async function resolveAccount(req, res, conversationKey) {
+  const clientKey = getApiKey(req.headers);
+  if (clientKey && (!POOL || POOL_CFG.passthroughClientKeys)) return { kind: 'ok', ctx: passthroughContext(clientKey) };
+  if (!POOL) return { kind: 'missing' };
+
+  const ac = new AbortController();
+  const onClose = () => ac.abort();
+  res.once('close', onClose);
+  let lease;
+  try {
+    lease = await POOL.acquire(conversationKey, { signal: ac.signal });
+  } catch (e) {
+    if (ac.signal.aborted) return { kind: 'gone' };
+    log('warn', 'Account pool admission failed', { message: e.message, status: e.status });
+    return { kind: 'error', status: e.status || 503, type: e.type || 'server_busy', message: e.message, retryAfter: e.retryAfter ?? 5 };
+  } finally {
+    res.off('close', onClose);
+  }
+  const release = () => lease.release();
+  if (res.destroyed || res.writableEnded) { release(); return { kind: 'gone' }; }
+  res.once('finish', release);
+  res.once('close', release);
+  return { kind: 'ok', ctx: accountContext(lease.account, lease) };
+}
+
+/**
+ * 给池账号的上游响应体挂一个旁路：只看 error / finish 事件来给账号记健康，字节原样透传。
+ * 只解析可能是 error/finish 的短行；超长行（大 tool-call 等）直接跳过，不额外缓存。
+ */
+const HEALTH_TAP_MAX_LINE = 64 * 1024;
+function tapUpstreamHealth(response, lease, signal) {
+  if (!response.body) return response;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let tail = '';
+  let skipping = false;
+  let settled = false;
+  const scan = (line) => {
+    if (settled || line.length > HEALTH_TAP_MAX_LINE) return;
+    if (!line.includes('"error"') && !line.includes('"finish"')) return;
+    let ev;
+    try { ev = JSON.parse(line.trim()); } catch { return; }
+    if (ev?.type === 'error') {
+      settled = true;
+      const mapped = mapCcEventError(ev);
+      lease.report({ status: mapped.reportedStatus, code: mapped.code });
+    } else if (ev?.type === 'finish') {
+      settled = true;
+      lease.reportSuccess();
+    }
+  };
+  const body = new ReadableStream({
+    async pull(controller) {
+      let r;
+      try {
+        r = await reader.read();
+      } catch (e) {
+        if (!signal?.aborted && e?.message !== 'STREAM_IDLE_TIMEOUT') lease.reportTransportError(e);
+        controller.error(e);
         return;
       }
-      resolve(socket);
-    });
-    connectReq.on('timeout', () => connectReq.destroy(new Error('upstream proxy CONNECT timeout')));
-    connectReq.on('error', reject);
-    onAbort(() => { try { connectReq.destroy(); } catch {} });
-    connectReq.end();
+      if (r.done) {
+        if (!skipping && tail) scan(tail);
+        controller.close();
+        return;
+      }
+      if (!settled) {
+        const text = decoder.decode(r.value, { stream: true });
+        let from = 0;
+        let nl;
+        while ((nl = text.indexOf('\n', from)) !== -1) {
+          if (!skipping) scan(tail + text.slice(from, nl));
+          tail = '';
+          skipping = false;
+          from = nl + 1;
+        }
+        if (!skipping) {
+          tail += text.slice(from);
+          if (tail.length > HEALTH_TAP_MAX_LINE) { tail = ''; skipping = true; }
+        }
+      }
+      controller.enqueue(r.value);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
   });
-
-  // 2. 隧道上做 TLS（证书按目标主机名校验，不做任何降级）
-  let socket = rawSocket;
-  if (isTls) {
-    socket = tls.connect({ socket: rawSocket, servername: u.hostname });
-    await new Promise((resolve, reject) => {
-      socket.once('secureConnect', resolve);
-      socket.once('error', reject);
-      onAbort(() => { try { socket.destroy(); } catch {} });
-    });
-  }
-
-  // 3. 复用隧道 socket 发请求
-  return await new Promise((resolve, reject) => {
-    const mod = isTls ? https : http;
-    const req = mod.request({
-      host: u.hostname,
-      port,
-      path: u.pathname + u.search,
-      method: options.method || 'GET',
-      headers: options.headers || {},
-      createConnection: () => socket,
-    }, (res) => {
-      // 204/205/304 按规范不允许带 body，Response 构造器会直接抛 —— 这两个状态必须传 null，
-      // 同时把连接排空，避免隧道 socket 悬着。
-      const nullBodyStatus = res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304;
-      if (nullBodyStatus) { try { res.resume(); } catch {} }
-      resolve(new Response(nullBodyStatus ? null : Readable.toWeb(res), {
-        status: res.statusCode,
-        statusText: res.statusMessage,
-        headers: headersToInit(res.headers),
-      }));
-    });
-    req.on('error', reject);
-    onAbort(() => { try { req.destroy(); } catch {} });
-    if (body !== undefined && body !== null) req.write(body);
-    req.end();
-  });
-}
-
-/** 上游请求入口：配了代理走隧道，否则用原生 fetch（默认路径行为完全不变）。 */
-function upstreamFetch(urlStr, options) {
-  return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 }
 
 // ── 流式转发 ────────────────────────────────────────
 
-async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
+// ── 请求头（逐键对齐 CLI 1.73.4）─────────────────────
+// createNodeTransport 先放小写的 "content-type"，buildCommandAuthHeaders 再放 "Content-Type" —— 两个键大小写不同，
+// fetch 的 Headers 会把它们合并成一行 `content-type: application/json, application/json`，真机线上就是这样。
+// 键的插入顺序 = undici 的发送顺序，也照搬。
+function buildCommandAuthHeaders(ctx, sessionId, { zdr = CFG.zdr } = {}) {
+  return {
+    'content-type': 'application/json',
+    'Content-Type': 'application/json',
+    'User-Agent': 'cli',
+    'x-command-code-version': CC_VERSION,
+    'x-cli-environment': 'production',
+    'x-project-slug': slugifyProjectPath(ctx.deviceProfile.projectDir),
+    'x-taste-learning': String(CFG.tasteLearning === true),
+    'x-session-id': sessionId,
+    'Authorization': `Bearer ${ctx.key}`,
+    ...(zdr ? { 'x-cmd-zdr': '1' } : {}),
+  };
+}
+
+/**
+ * 上游 NDJSON 的统一整形（所有上下文都过这一层，各协议的翻译器因此不必各改一遍）。对齐 CLI 的 consumeStream：
+ *   - providerExecuted 的 tool-call（服务端自己执行的工具，如联网搜索）与 tool-result 事件：CLI 不执行、
+ *     也不回放进历史 → 丢弃，绝不能当成要客户端执行的工具调用转出去；
+ *   - abort：CLI 视为正常结束（不报截断）→ 改写成 finish；
+ *   - cache-write-tokens：纯计量事件 → 丢弃；
+ *   - error 的 error 字段可能是裸字符串 → 规整成 { message }；
+ *   - tool-call：工具名改回客户端原名（TOOL_NAME_ALIASES 的反向），输入按 CLI 的 coerceToolInput 修整；
+ *   - finish：totalUsage 缺 cachedInputTokens 时用 inputTokenDetails.cacheReadTokens 补上（CLI 读的是后者）。
+ * 只有可能需要改写的行才缓存到换行再解析；text-delta 等在行首认出类型后立即原样透传（不额外延迟、不攒长行）。
+ */
+const NORMALIZE_TYPES = new Set(['tool-call', 'tool-result', 'abort', 'cache-write-tokens', 'error', 'finish', 'tool-input-start']);
+const LINE_TYPE_RE = /^\s*\{\s*"type"\s*:\s*"([^"]*)"/;
+
+function coerceToolInput(raw, schema) {
+  let value = raw;
+  if (Array.isArray(value) && value.length === 1) value = value[0];
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    let text = value;
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+      if (typeof parsed !== 'string') return {};
+      text = parsed;
+    } catch {}
+    // wrapBareStringRoot：schema 恰好只有一个必填字段时，把裸字符串包进去
+    const required = schema?.required;
+    if (Array.isArray(required) && required.length === 1 && typeof required[0] === 'string') {
+      const prop = schema.properties?.[required[0]];
+      return { [required[0]]: prop && prop.type === 'array' ? [text] : text };
+    }
+  }
+  return {};
+}
+
+function normalizeEventLine(line, { toolAliases, toolSchemas }) {
+  let ev;
+  try { ev = JSON.parse(line); } catch { return line; }
+  if (!ev || typeof ev !== 'object') return line;
+  switch (ev.type) {
+    case 'tool-result':
+    case 'cache-write-tokens':
+      return null;
+    case 'tool-input-start':
+      if (ev.providerExecuted === true) return null;
+      if (toolAliases?.[ev.toolName]) { ev.toolName = toolAliases[ev.toolName]; return JSON.stringify(ev); }
+      return line;
+    case 'tool-call': {
+      if (ev.providerExecuted === true) return null;
+      const wire = ev.toolName ?? '';
+      const input = coerceToolInput(ev.input ?? ev.args, toolSchemas?.get(wire));
+      ev.toolName = toolAliases?.[wire] ?? wire;
+      ev.input = input;
+      delete ev.args;
+      return JSON.stringify(ev);
+    }
+    case 'abort':
+      return JSON.stringify({ type: 'finish', finishReason: 'stop' });
+    case 'error':
+      if (typeof ev.error === 'string') { ev.error = { message: ev.error }; return JSON.stringify(ev); }
+      return line;
+    case 'finish': {
+      const u = ev.totalUsage;
+      const cacheRead = u?.inputTokenDetails?.cacheReadTokens;
+      if (u && u.cachedInputTokens === undefined && typeof cacheRead === 'number') {
+        u.cachedInputTokens = cacheRead;
+        return JSON.stringify(ev);
+      }
+      return line;
+    }
+    default:
+      return line;
+  }
+}
+
+function normalizeUpstreamStream(response, opts) {
+  if (!response.body) return response;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buf = '';          // 当前行已收到、尚未输出的部分
+  let mode = 'undecided'; // undecided | pass（原样透传到行尾）| hold（攒到行尾再整形）
+  const decide = () => {
+    const m = LINE_TYPE_RE.exec(buf);
+    if (m) mode = NORMALIZE_TYPES.has(m[1]) ? 'hold' : 'pass';
+    else if (buf.length >= 128 || /^\s*[^\s{]/.test(buf)) mode = 'hold'; // type 不在首键 / 非 JSON：保守地整行处理
+  };
+  const flushLine = (line, out) => {
+    if (mode === 'pass') { out.push(line); return; }
+    const fixed = line.trim() ? normalizeEventLine(line, opts) : line;
+    if (fixed !== null) out.push(fixed);
+  };
+  const transform = (text) => {
+    const out = [];
+    let from = 0;
+    for (;;) {
+      const nl = text.indexOf('\n', from);
+      const seg = nl === -1 ? text.slice(from) : text.slice(from, nl);
+      if (mode === 'pass') {
+        out.push(seg);
+      } else {
+        buf += seg;
+        if (mode === 'undecided') {
+          decide();
+          if (mode === 'pass') { out.push(buf); buf = ''; }
+        }
+      }
+      if (nl === -1) break;
+      if (mode !== 'pass') {
+        const line = buf;
+        buf = '';
+        const keep = [];
+        flushLine(line, keep);
+        if (keep.length) out.push(keep[0] + '\n');
+      } else {
+        out.push('\n');
+      }
+      mode = 'undecided';
+      from = nl + 1;
+    }
+    return out.join('');
+  };
+  const body = new ReadableStream({
+    async pull(controller) {
+      for (;;) {
+        let r;
+        try {
+          r = await reader.read();
+        } catch (e) {
+          controller.error(e);
+          return;
+        }
+        if (r.done) {
+          let rest = transform(decoder.decode());
+          if (buf) { const keep = []; flushLine(buf, keep); rest += keep.join(''); buf = ''; }
+          if (rest) controller.enqueue(encoder.encode(rest));
+          controller.close();
+          return;
+        }
+        const out = transform(decoder.decode(r.value, { stream: true }));
+        if (out) { controller.enqueue(encoder.encode(out)); return; }
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+}
+
+async function forwardToCC(body, ctx, incomingHeaders = {}, signal, promptCacheKey) {
+  // 先取旁路信息：下面按 CLI 键序重排信封时会换成新对象
+  const toolAliases = body[WIRE_TOOL_ALIASES];
+  const toolSchemas = body[WIRE_TOOL_SCHEMAS];
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
+  const sessionId = getSessionId(incomingHeaders, ctx, promptCacheKey);
+  // 池账号：工作目录换成该账号自己的设备档案（buildCcRequest 时还不知道是哪个账号）
+  if (ctx.pooled) body = { ...body, config: { ...body.config, workingDir: ctx.deviceProfile.projectDir } };
   // CLI 的 toWireThreadId：只有合法 UUID 才放进信封，否则整个键省略。
   // 同时按 CLI 的键顺序重排：config, memory, taste, skills, permissionMode, threadId, mode, params
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sessionId))) {
+  if (UUID_RE.test(String(sessionId))) {
     const ordered = {};
     for (const k of ['config', 'memory', 'taste', 'skills', 'permissionMode']) ordered[k] = body[k];
     ordered.threadId = sessionId;
@@ -1314,31 +1906,38 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     body = ordered;
   }
 
-  // 与 CLI 的 buildCommandAuthHeaders 对齐：没有 x-co-flag；User-Agent 固定 "cli"
   const headers = {
-    'Content-Type': 'application/json',
-    'User-Agent': 'cli',
-    'x-command-code-version': CC_VERSION,
-    'x-cli-environment': 'production',
-    'x-project-slug': slugifyProjectPath(DEVICE_PROFILE.projectDir),
-    'x-taste-learning': 'false',
-    'x-session-id': sessionId,
-    'Authorization': `Bearer ${apiKey}`,
+    ...buildCommandAuthHeaders(ctx, sessionId, { zdr: CFG.zdr || incomingHeaders['x-cmd-zdr'] === '1' }),
+    // createModelClient 追加的请求级头：x-cmd-zdr（与上面同名同值，展开后只剩一个）+ OTel 的 traceparent
     'traceparent': traceparent,
   };
-
-  if (CFG.zdr || incomingHeaders['x-cmd-zdr'] === '1') {
-    headers['x-cmd-zdr'] = '1';
+  let response;
+  try {
+    response = await ctx.fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (e) {
+    if (!signal?.aborted) ctx.lease?.reportTransportError(e);
+    throw e;
   }
+  if (response.ok) response = normalizeUpstreamStream(response, { toolAliases, toolSchemas });
+  if (!ctx.lease) return response;
 
-  const response = await upstreamFetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  return response;
+  // 池账号：在这里统一给账号记健康（HTTP 错误码 + 流内 error/finish 事件），各 handler 不必关心
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    const mapped = mapCcError(response.status, text);
+    ctx.lease.report({
+      status: response.status,
+      code: mapped.code,
+      retryAfterMs: parseRetryAfterMs(response.headers.get('retry-after')),
+    });
+    return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
+  }
+  return tapUpstreamHealth(response, ctx.lease, signal);
 }
 
 // ── 路由 ────────────────────────────────────────────
@@ -1356,11 +1955,18 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  const acct = await resolveAccount(req, res, conversationKeyOf(req.headers, openaiReq));
+  if (acct.kind === 'missing') {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
+  if (acct.kind === 'gone') return;
+  if (acct.kind === 'error') {
+    res.setHeader('Retry-After', String(acct.retryAfter));
+    sendJSON(res, acct.status, { error: { message: acct.message, type: acct.type }, retry_after: acct.retryAfter });
+    return;
+  }
+  const ctx = acct.ctx;
 
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
@@ -1417,9 +2023,9 @@ async function handleChatCompletions(req, res) {
 
   try {
     // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
+    await ensureInitialized(ctx, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    const ccResponse = await forwardToCC(ccBody, ctx, req.headers, abortController.signal, openaiReq.prompt_cache_key);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -1520,7 +2126,7 @@ async function handleChatCompletions(req, res) {
 
         if (!aborted) {
           // 成功完成一次请求，重置连续超时计数
-          consecutiveTimeouts = 0;
+          ctx.timeouts.count = 0;
           // 处理剩余 buffer
           if (buffer.trim()) {
             const events = translator.parseLine(buffer);
@@ -1597,8 +2203,8 @@ async function handleChatCompletions(req, res) {
           });
           try { reader.cancel().catch(() => {}); } catch {}
           try { abortController.abort(); } catch {} // 打断 CC 上游，避免浪费 token
-          consecutiveTimeouts++;
-          const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+          ctx.timeouts.count++;
+          const timeoutMsg = ctx.timeouts.count >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
             ? 'Response timeout - try reducing context length (summarize earlier messages)'
             : 'Response timeout - request timed out';
           if (!started) {
@@ -1762,7 +2368,7 @@ async function handleChatCompletions(req, res) {
         return;
       }
 
-      consecutiveTimeouts = 0;
+      ctx.timeouts.count = 0;
       sendJSON(res, 200, {
         id: completionId,
         object: 'chat.completion',
@@ -1821,8 +2427,8 @@ async function handleChatCompletions(req, res) {
       });
       try { reader?.cancel().catch(() => {}); } catch {}
       try { abortController.abort(); } catch {} // 打断 CC 上游
-      consecutiveTimeouts++;
-      const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+      ctx.timeouts.count++;
+      const timeoutMsg = ctx.timeouts.count >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
         ? 'Response timeout - try reducing context length (summarize earlier messages)'
         : 'Response timeout - request timed out';
       res.setHeader('Retry-After', '5');
@@ -2073,6 +2679,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
       openaiReq.tool_choice = 'none';
     }
   }
+  if (anthropicReq.tool_choice?.disable_parallel_tool_use === true) openaiReq.parallel_tool_calls = false;
 
   // 6. Optional params
   if (anthropicReq.temperature !== undefined) openaiReq.temperature = anthropicReq.temperature;
@@ -2365,18 +2972,24 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
-    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
-    return;
-  }
-
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
 
   // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
+
+  const acct = await resolveAccount(req, res, conversationKeyOf(req.headers, openaiReq));
+  if (acct.kind === 'missing') {
+    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
+    return;
+  }
+  if (acct.kind === 'gone') return;
+  if (acct.kind === 'error') {
+    sendAnthropicError(res, acct.status, acct.type === 'rate_limit_error' ? 'rate_limit_error' : 'overloaded_error', acct.message, acct.retryAfter);
+    return;
+  }
+  const ctx = acct.ctx;
 
   const abortController = new AbortController();
   let aborted = false;
@@ -2388,8 +3001,8 @@ async function handleMessages(req, res) {
 
   try {
     // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    await ensureInitialized(ctx, abortController.signal);
+    const ccResponse = await forwardToCC(ccBody, ctx, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -2480,7 +3093,7 @@ async function handleMessages(req, res) {
         }
 
         if (!aborted) {
-          consecutiveTimeouts = 0;
+          ctx.timeouts.count = 0;
           if (ctx.upstreamError) {
             if (!started) {
               sendAnthropicError(
@@ -2521,16 +3134,16 @@ async function handleMessages(req, res) {
           });
           try { abortController.abort(); } catch {} // 打断 CC 上游
           if (!started) {
-            consecutiveTimeouts++;
-            const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+            ctx.timeouts.count++;
+            const timeoutMsg = ctx.timeouts.count >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
               ? 'Response timeout - try reducing context length (summarize earlier messages)'
               : 'Response timeout - request timed out';
             sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
             return;
           }
           if (!res.writableEnded) {
-            consecutiveTimeouts++;
-            const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+            ctx.timeouts.count++;
+            const timeoutMsg = ctx.timeouts.count >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
               ? 'Response timeout - try reducing context length (summarize earlier messages)'
               : 'Response timeout - request timed out';
             // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
@@ -2665,7 +3278,7 @@ async function handleMessages(req, res) {
         return;
       }
 
-      consecutiveTimeouts = 0;
+      ctx.timeouts.count = 0;
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
     }
   } catch (e) {
@@ -2689,8 +3302,8 @@ async function handleMessages(req, res) {
       });
       try { reader?.cancel().catch(() => {}); } catch {}
       try { abortController.abort(); } catch {} // 打断 CC 上游
-      consecutiveTimeouts++;
-      const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+      ctx.timeouts.count++;
+      const timeoutMsg = ctx.timeouts.count >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
         ? 'Response timeout - try reducing context length (summarize earlier messages)'
         : 'Response timeout - request timed out';
       res.setHeader('Retry-After', '5');
@@ -2705,46 +3318,71 @@ async function handleMessages(req, res) {
 
 // ── 动态模型列表 ────────────────────────────────────
 
-let dynamicModels = null;
-let modelsLastFetch = 0;
+// 缓存按上下文分开：透传模式共用一份（行为不变），池账号各用各的 —— 不把一个账号的目录发给另一个账号的请求。
+function modelsRequestHeaders(apiKey) {
+  return {
+    'Authorization': `Bearer ${apiKey}`,
+    'x-cli-environment': 'production',
+    'x-command-code-version': CC_VERSION,
+  };
+}
 
-async function fetchModels(apiKey) {
-  const now = Date.now();
-  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
-    return dynamicModels;
+function cacheProviderModels(cache, data) {
+  if (!Array.isArray(data?.data)) return false;
+  cache.models = data.data.map(m => ({ id: m.id, name: m.id }));
+  cache.at = Date.now();
+  return true;
+}
+
+async function fetchModels(ctx) {
+  const cache = ctx?.modelsCache ?? globalModelsCache;
+  if (cache.models && (Date.now() - cache.at) < CFG.modelRefreshIntervalMs) {
+    return cache.models;
   }
 
   try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
+    if (!ctx?.key || !CFG.useProviderModels) throw new Error('Provider models disabled');
 
-    const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'x-cli-environment': 'production',
-        'x-command-code-version': CC_VERSION,
-      },
+    const response = await ctx.fetch(`${CFG.apiBase}/provider/v1/models`, {
+      headers: modelsRequestHeaders(ctx.key),
       signal: AbortSignal.timeout(10000),
     });
 
     if (response.ok) {
-      const data = await response.json();
-      if (Array.isArray(data.data)) {
-        dynamicModels = data.data.map(m => ({
-          id: m.id,
-          name: m.id,
-        }));
-        modelsLastFetch = now;
-        log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
-        return dynamicModels;
+      if (cacheProviderModels(cache, await response.json())) {
+        log('info', 'Fetched models from Provider API', { count: cache.models.length, ...ctx.logTag });
+        return cache.models;
       }
+    } else {
+      response.body?.cancel().catch(() => {});
     }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
+    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status, ...ctx.logTag });
   } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
+    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message, ...ctx?.logTag });
   }
 
   // Fallback to hardcoded MODELS
   return MODELS;
+}
+
+/** 账号池健康探测：经该账号自己的路由打 GET /alpha/whoami —— CLI 每次开会话都会调（billing 预取的第一步），
+ *  认证、不耗推理额度；头与 /alpha/generate 相同。（/provider/v1/models 是 CLI 从不调用的端点，不拿来探测。） */
+async function probePooledAccount(account) {
+  const ctx = accountContext(account);
+  const response = await account.fetch(`${CFG.apiBase}/alpha/whoami`, {
+    method: 'GET',
+    headers: buildCommandAuthHeaders(ctx, ensureSession(ctx.key, ctx.sessions)),
+    signal: AbortSignal.timeout(10000),
+  });
+  const text = await response.text().catch(() => '');
+  if (response.ok) return { ok: true };
+  const mapped = mapCcError(response.status, text);
+  return {
+    ok: false,
+    status: response.status,
+    code: mapped.code,
+    retryAfterMs: parseRetryAfterMs(response.headers.get('retry-after')),
+  };
 }
 
 // ── OpenAI Responses API（/v1/responses）──────────────
@@ -2982,6 +3620,7 @@ function convertResponsesToChat(respReq) {
   const out = { model: respReq.model, messages, stream: respReq.stream === true };
   if (tools) out.tools = tools;
   if (toolChoice) out.tool_choice = toolChoice;
+  if (respReq.parallel_tool_calls === false) out.parallel_tool_calls = false;
   if (respReq.max_output_tokens !== undefined) out.max_tokens = respReq.max_output_tokens;
   if (respReq.temperature !== undefined) out.temperature = respReq.temperature;
   if (respReq.top_p !== undefined) out.top_p = respReq.top_p;
@@ -3312,18 +3951,25 @@ async function handleResponses(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
-    sendResponsesError(res, 401, 'authentication_error',
-      'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
-    return;
-  }
-
   let chatReq = convertResponsesToChat(respReq);
   if (!chatReq.messages.length) {
     sendResponsesError(res, 400, 'invalid_request_error', 'input is required');
     return;
   }
+
+  const acct = await resolveAccount(req, res, conversationKeyOf(req.headers, chatReq));
+  if (acct.kind === 'missing') {
+    sendResponsesError(res, 401, 'authentication_error',
+      'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
+    return;
+  }
+  if (acct.kind === 'gone') return;
+  if (acct.kind === 'error') {
+    res.setHeader('Retry-After', String(acct.retryAfter));
+    sendResponsesError(res, acct.status, acct.type, acct.message, acct.retryAfter);
+    return;
+  }
+  const ctx = acct.ctx;
 
   const stream = chatReq.stream === true;
   const model = chatReq.model || 'deepseek/deepseek-v4-flash';
@@ -3361,8 +4007,8 @@ async function handleResponses(req, res) {
   });
 
   try {
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    await ensureInitialized(ctx, abortController.signal);
+    const ccResponse = await forwardToCC(ccBody, ctx, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -3456,7 +4102,7 @@ async function handleResponses(req, res) {
             if (!started) { res.writeHead(200, SSE_HEADERS); started = true; }
             for (const e2 of translator.finish()) res.write(e2);
           }
-          consecutiveTimeouts = 0;
+          ctx.timeouts.count = 0;
         }
       } catch (e) {
         if (aborted) {
@@ -3466,8 +4112,8 @@ async function handleResponses(req, res) {
             path: '/v1/responses', model, streaming: true, timeoutMs: STREAM_IDLE_TIMEOUT_MS,
             elapsedMs: Date.now() - startTime, bytesReceived, lastCcEvent: lastCcEvent || '(none)',
           });
-          consecutiveTimeouts++;
-          const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+          ctx.timeouts.count++;
+          const timeoutMsg = ctx.timeouts.count >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
             ? 'Response timeout - try reducing context length (summarize earlier messages)'
             : 'Response timeout - request timed out';
           if (!started) { sendResponsesError(res, 429, 'rate_limit_error', timeoutMsg, 5); return; }
@@ -3603,7 +4249,7 @@ async function handleResponses(req, res) {
         return;
       }
 
-      consecutiveTimeouts = 0;
+      ctx.timeouts.count = 0;
       echoOpts.finishReason = finishReason;
       sendJSON(res, 200, buildResponsesObject(
         responseId, model, created, fullText, thinkingText, toolCalls, usage, echoOpts));
@@ -3622,7 +4268,11 @@ async function handleResponses(req, res) {
 
 async function handleModels(req, res) {
   const apiKey = getApiKey(req.headers);
-  const models = await fetchModels(apiKey);
+  // 池模式：用当前最空闲的健康账号的目录（不占槽位，也绝不把多个账号的目录并集）
+  const ctx = apiKey && (!POOL || POOL_CFG.passthroughClientKeys) ? passthroughContext(apiKey)
+    : POOL ? accountContext(POOL.peek())
+    : null;
+  const models = await fetchModels(ctx);
   const now = nowUnix();
   sendJSON(res, 200, {
     object: 'list',
@@ -3635,9 +4285,44 @@ async function handleModels(req, res) {
   });
 }
 
+function handlePoolStats(req, res) {
+  res.setHeader('Cache-Control', 'no-store');
+  sendJSON(res, 200, POOL.stats());
+}
+
 function handleHealth(req, res) {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
+}
+
+// ── 账号池启动 ──────────────────────────────────────
+// 配置错误一律拒绝启动（与 upstreamProxy 同理：写错应当立刻暴露，而不是每个请求各错一次）。
+let POOL = null;
+let POOL_CFG = null;
+const isLoopbackHost = (h) => h === '127.0.0.1' || h === '::1' || h === 'localhost' || /^127\./.test(h);
+if (CFG.poolConfig) {
+  try {
+    POOL_CFG = loadPoolConfig(CFG.poolConfig);
+  } catch (e) {
+    log('error', 'Invalid pool config, refusing to start', { error: e.message });
+    process.exit(1);
+  }
+  // 账号池模式不做客户端鉴权（与 openai-oauth fork 的 pool:serve 一致）：能连上就能用池里所有账号。
+  // 因此默认只许绑回环地址；要对外监听必须显式放行，并自行在前面加鉴权 / TLS。
+  const allowNetwork = POOL_CFG.allowNetwork || process.env.CC_POOL_ALLOW_NETWORK === '1';
+  if (!isLoopbackHost(CFG.host) && !allowNetwork) {
+    log('error', 'Refusing to bind a non-loopback host in pool mode', {
+      host: CFG.host,
+      hint: 'set HOST=127.0.0.1, or set "allowNetwork": true in the pool config / CC_POOL_ALLOW_NETWORK=1 and put your own auth in front',
+    });
+    process.exit(1);
+  }
+  for (const w of POOL_CFG.warnings) log('warn', 'Pool config warning', { warning: w });
+  POOL = createPool(POOL_CFG, {
+    log,
+    createState: createAccountProtocolState,
+    probe: probePooledAccount,
+  });
 }
 
 // ── 服务器 ──────────────────────────────────────────
@@ -3657,7 +4342,8 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${host}`);
 
   // 在途上限准入。/health 与 / 例外：探活与编排器不该因业务繁忙而收 503。
-  const isLiveness = url.pathname === '/health' || url.pathname === '/';
+  const isPoolStats = POOL && POOL_CFG.diagnostics && url.pathname === '/pool/stats' && req.method === 'GET';
+  const isLiveness = url.pathname === '/health' || url.pathname === '/' || isPoolStats;
   if (!isLiveness && MAX_INFLIGHT > 0) {
     if (inflightCount >= MAX_INFLIGHT) {
       log('warn', 'In-flight limit reached, rejecting request', {
@@ -3691,6 +4377,8 @@ const server = http.createServer(async (req, res) => {
       await handleResponses(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
+    } else if (isPoolStats) {
+      handlePoolStats(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {
       handleHealth(req, res);
     } else {
@@ -3747,6 +4435,13 @@ server.listen(CFG.port, CFG.host, () => {
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
     upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
+    pool: POOL ? {
+      accounts: POOL.accounts.map(a => `${a.name} via ${a.proxyLabel}`),
+      maxInflightPerAccount: POOL_CFG.maxInflightPerAccount,
+      healthRefresh: POOL_CFG.healthRefreshMs > 0 ? `${POOL_CFG.healthRefreshMs}ms` : 'off',
+      clientKeys: POOL_CFG.passthroughClientKeys ? 'passthrough (requests with their own user_ key bypass the pool)' : 'ignored',
+      diagnostics: POOL_CFG.diagnostics ? 'GET /pool/stats' : 'off',
+    } : 'off (single-key mode)',
     upstreamRetry: UPSTREAM_RETRY_MAX > 0
       ? `${UPSTREAM_RETRY_MAX} retries, base ${UPSTREAM_RETRY_BASE_MS}ms (only before first byte)`
       : 'disabled (CC_UPSTREAM_RETRY_MAX=0)',
@@ -3764,7 +4459,7 @@ server.listen(CFG.port, CFG.host, () => {
       hint: 'lower CC_MAX_BODY_MB, set CC_MAX_INFLIGHT, and/or cap in-flight requests at the reverse proxy (see README)',
     });
   }
-  if (!CFG.apiKey) {
+  if (!CFG.apiKey && !POOL) {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
 });
